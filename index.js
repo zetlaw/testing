@@ -752,15 +752,20 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
 
 
-// Start server (remains the same)
-// ... serveHTTP ...
+// Start server (modified for Vercel)
 const addonInterface = builder.getInterface();
 
-serveHTTP(addonInterface, { port: process.env.PORT || 8000 })
-    .then(({ url }) => {
-        console.log(`🚀 Mako VOD Stremio Add-on running at ${url}/manifest.json`);
-        console.log(`Add to Stremio by opening: stremio://${url.replace(/^https?:\/\//, '')}/manifest.json`);
-    })
-    .catch(err => {
-        console.error('Error starting server:', err);
-    });
+// Export the addon interface for Vercel
+module.exports = addonInterface;
+
+// Only start the server if we're not in a serverless environment
+if (process.env.NODE_ENV !== 'production') {
+    serveHTTP(addonInterface, { port: process.env.PORT || 8000 })
+        .then(({ url }) => {
+            console.log(`🚀 Mako VOD Stremio Add-on running at ${url}/manifest.json`);
+            console.log(`Add to Stremio by opening: stremio://${url.replace(/^https?:\/\//, '')}/manifest.json`);
+        })
+        .catch(err => {
+            console.error('Error starting server:', err);
+        });
+}
