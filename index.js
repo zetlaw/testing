@@ -770,15 +770,11 @@ const handler = async (req, res) => {
         // Set CORS headers for all responses
         res.setHeader('Access-Control-Allow-Origin', '*');
 
-        // Use serveHTTP to handle the request
-        const { url } = await serveHTTP(addonInterface, { 
-            port: process.env.PORT || 8000,
-            request: req,
-            response: res
-        });
-
-        // If we get here, the request was handled successfully
-        res.status(200).end();
+        // Handle the request using the addon interface
+        const response = await addonInterface(req.url, req.headers);
+        
+        // Send the response
+        res.json(response);
     } catch (error) {
         console.error('Error handling request:', error);
         res.status(500).json({ error: 'Internal Server Error' });
