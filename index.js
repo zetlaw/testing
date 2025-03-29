@@ -755,8 +755,31 @@ builder.defineStreamHandler(async ({ type, id }) => {
 // Start server (modified for Vercel)
 const addonInterface = builder.getInterface();
 
-// Export the addon interface for Vercel
-module.exports = addonInterface;
+// Export the handler function for Vercel
+module.exports = async (req, res) => {
+    try {
+        // Handle CORS preflight requests
+        if (req.method === 'OPTIONS') {
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+            res.status(200).end();
+            return;
+        }
+
+        // Handle the actual request
+        const response = await addonInterface(req, res);
+        
+        // Set CORS headers for all responses
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        
+        // Send the response
+        res.json(response);
+    } catch (error) {
+        console.error('Error handling request:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+};
 
 // Only start the server if we're not in a serverless environment
 if (process.env.NODE_ENV !== 'production') {
