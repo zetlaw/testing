@@ -755,8 +755,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
 // Start server (modified for Vercel)
 const addonInterface = builder.getInterface();
 
-// Export the handler function for Vercel
-module.exports = async (req, res) => {
+// Create the handler function
+const handler = async (req, res) => {
     try {
         // Handle CORS preflight requests
         if (req.method === 'OPTIONS') {
@@ -780,6 +780,9 @@ module.exports = async (req, res) => {
         res.status(500).json({ error: 'Internal Server Error' });
     }
 };
+
+// Export the handler function for Vercel
+module.exports = handler;
 
 // Only start the server if we're not in a serverless environment
 if (process.env.NODE_ENV !== 'production') {
