@@ -3,12 +3,17 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
-  "keywords": [],
+  "keywords": [
+    "stremio",
+    "addon",
+    "streaming"
+  ],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Stremio addon for streaming content",
   "dependencies": {
     "axios": "^1.8.4",
     "cheerio": "^1.0.0",
@@ -16,5 +21,8 @@
     "crypto-js": "^4.2.0",
     "express": "^4.21.2",
     "stremio-addon-sdk": "^1.6.10"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
   }
 }
