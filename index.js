@@ -149,10 +149,10 @@ const processImageUrl = (url) => {
 };
 
 
-// Show name extraction (remains the same)
-// ... extractShowName ...
+// Show name extraction (modified for serverless)
 const extractShowName = async (url) => {
     try {
+        console.log(`Extracting show name from ${url}`);
         const response = await axios.get(url, {
             headers: HEADERS,
             timeout: REQUEST_TIMEOUT,
@@ -161,24 +161,31 @@ const extractShowName = async (url) => {
         const $ = cheerio.load(response.data);
         const jsonldTag = $('script[type="application/ld+json"]').html();
 
-        if (!jsonldTag) return null;
+        if (!jsonldTag) {
+            console.log(`No JSON-LD found for ${url}`);
+            return null;
+        }
 
         const data = JSON.parse(jsonldTag);
+        console.log(`Found JSON-LD data type: ${data['@type']}`);
 
         let name;
         if (data['@type'] === 'TVSeason' && data.partOfTVSeries) {
             name = data.partOfTVSeries.name;
-            // console.log(`Found TVSeason, using series name from partOfTVSeries: ${name}`);
+            console.log(`Found TVSeason, using series name from partOfTVSeries: ${name}`);
         } else {
             name = data.name;
         }
 
-        // console.log(`Raw name found in JSON: ${name}`);
+        // For debugging, print the raw name exactly as found in JSON
+        console.log(`Raw name found in JSON: ${name}`);
 
+        // Optional: Add season info if available
         if (data.containsSeason && Array.isArray(data.containsSeason) && data.containsSeason.length > 1) {
-             name = `${name} (${data.containsSeason.length} עונות)`;
+            name = `${name} (${data.containsSeason.length} עונות)`;
         }
 
+        // Get poster and background images
         let poster = $('meta[property="og:image"]').attr('content') ||
                     $('meta[name="twitter:image"]').attr('content') ||
                     $('link[rel="image_src"]').attr('href') ||
@@ -204,6 +211,7 @@ const extractShowName = async (url) => {
             background = poster;
         }
 
+        console.log(`Extracted show details for ${url}:`, { name, poster, background });
         return { name, poster, background };
     } catch (e) {
         console.error(`Error extracting show name from ${url}:`, e.message);
@@ -427,19 +435,8 @@ const extractContent = async (url, contentType) => {
             if (items.length > 0) {
                 console.log('First 5 shows:', items.slice(0, 5).map(s => ({ name: s.name, url: s.url })));
             }
-        }
 
-        if (contentType === 'episodes') {
-            for (const ep of items) {
-                if (!ep.guid && ep.url) {
-                    const match = ep.url.match(/[?&](guid|videoGuid)=([\w-]+)/i);
-                    if (match) ep.guid = match[2];
-                }
-            }
-            return items.filter(ep => ep.guid); // Only return episodes with GUID
-        }
-
-        if (contentType === 'shows') {
+            // Load cache and process show names
             const cache = await loadCache();
             const cacheIsFresh = Date.now() - cache.timestamp < CACHE_TTL;
 
@@ -450,38 +447,50 @@ const extractContent = async (url, contentType) => {
                 for (const show of items) {
                     if (cache.shows[show.url]) {
                         show.name = cache.shows[show.url].name;
-                        show.poster = cache.shows[show.url].poster || show.poster; // Prefer cached poster if available
-                        show.background = cache.shows[show.url].background || show.poster; // Use cached bg or poster
+                        show.poster = cache.shows[show.url].poster || show.poster;
+                        show.background = cache.shows[show.url].background || show.poster;
                         cachedCount++;
-                    } else {
-                         // Ensure defaults if not in cache
-                         show.poster = show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
-                         show.background = show.poster;
                     }
                 }
-            } else {
-                 // Ensure defaults if cache is stale
-                 for (const show of items) {
-                     show.poster = show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
-                     show.background = show.poster;
-                 }
             }
 
-            if (cachedCount) console.log(`Using ${cachedCount} show details from fresh cache`);
-
-            // In serverless, don't start background processing
-            if (process.env.NODE_ENV === 'production') {
-                console.log("Running in serverless - skipping background name processing");
-                return items;
+            if (cachedCount) {
+                console.log(`Using ${cachedCount} show names from cache`);
             }
-            
+
+            // Process shows that aren't in cache
             const toFetch = items.filter(show => !(cacheIsFresh && cache.shows[show.url]));
-            if (toFetch.length === 0 && cacheIsFresh) {
-                console.log("All show names already in fresh cache!");
-            } else {
-                console.log(`Need to fetch/update ${toFetch.length} show names`);
-                // Start background processing without await
-                processShowNames(toFetch, cache, cacheIsFresh).catch(err => console.error("Background show name processing failed:", err));
+            if (toFetch.length > 0) {
+                console.log(`Need to fetch ${toFetch.length} show names`);
+                // Process shows in smaller batches to avoid timeouts
+                const BATCH_SIZE = process.env.NODE_ENV === 'production' ? 2 : 5;
+                for (let i = 0; i < toFetch.length; i += BATCH_SIZE) {
+                    const batch = toFetch.slice(i, i + BATCH_SIZE);
+                    const batchPromises = batch.map(async (show) => {
+                        try {
+                            const details = await extractShowName(show.url);
+                            if (details) {
+                                show.name = details.name;
+                                show.poster = details.poster;
+                                show.background = details.background;
+                                
+                                // Update cache
+                                if (!cache.shows[show.url]) cache.shows[show.url] = {};
+                                cache.shows[show.url] = {
+                                    name: details.name,
+                                    poster: details.poster,
+                                    background: details.background,
+                                    lastUpdated: Date.now()
+                                };
+                            }
+                        } catch (e) {
+                            console.error(`Error processing show ${show.url}:`, e.message);
+                        }
+                    });
+                    await Promise.all(batchPromises);
+                    await sleep(100); // Small delay between batches
+                }
+                await saveCache(cache);
             }
         }
 
