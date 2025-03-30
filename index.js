@@ -456,18 +456,22 @@ const extractContent = async (url, contentType) => {
         const configs = {
             shows: {
                 selectors: [
+                    'li > a[href^="/mako-vod-"]',
+                    'li a[href^="/mako-vod-"]',
                     '.vod_item_wrap article a[href^="/mako-vod-"]',
                     '.vod_item article a[href^="/mako-vod-"]',
-                    'li.grid-item a[href^="/mako-vod-"]',
                     'section[class*="vod"] a[href^="/mako-vod-"]',
-                    'a[href^="/mako-vod-"]:not([href*="purchase"]):not([href*="index"])',
+                    'a[href^="/mako-vod-"]:not([href*="purchase"]):not([href*="index"])'
                 ],
                 fields: {
                     url: { attribute: 'href' },
                     name: [
-                        { selector: '.title strong' }, { selector: 'h3.title' }, { selector: 'h2.title' },
-                        { selector: '.vod-title' }, { selector: '.caption' },
                         { selector: 'img', attribute: 'alt' },
+                        { selector: '.title strong' }, 
+                        { selector: 'h3.title' }, 
+                        { selector: 'h2.title' },
+                        { selector: '.vod-title' }, 
+                        { selector: '.caption' },
                         { text: true }
                     ],
                     poster: { selector: 'img', attribute: 'src' }
@@ -477,20 +481,30 @@ const extractContent = async (url, contentType) => {
             },
             seasons: {
                 selectors: ['div#seasonDropdown ul ul li a', '.seasons_nav a'],
-                fields: { name: { selector: 'span', text: true }, url: { attribute: 'href' } },
+                fields: { 
+                    name: { selector: 'span', text: true }, 
+                    url: { attribute: 'href' } 
+                },
                 base: url,
                 filter: (item) => item.url && item.name && !item.name.toLowerCase().includes('כל הפרקים')
             },
             episodes: {
                 selectors: [
-                    'li.vod_item a[href*="videoGuid="]', '.vod_item a[href*="videoGuid="]',
-                    '.vod_item_wrap a[href*="videoGuid="]', 'li.card a[href*="videoGuid="]',
+                    'li.card a', 
                     'a[href*="videoGuid="]',
-                    'li.vod_item a', '.vod_item a', '.vod_item_wrap a', 'li.card a'
+                    'li.vod_item a[href*="videoGuid="]', 
+                    '.vod_item a[href*="videoGuid="]',
+                    '.vod_item_wrap a[href*="videoGuid="]',
+                    'li.vod_item a', 
+                    '.vod_item a', 
+                    '.vod_item_wrap a'
                 ],
                 fields: {
                     name: [
-                        { selector: '.title strong' }, { selector: '.vod-title' }, { selector: '.caption' },
+                        { selector: 'strong.title' },
+                        { selector: '.title strong' }, 
+                        { selector: '.vod-title' }, 
+                        { selector: '.caption' },
                         { text: true }
                     ],
                     url: { attribute: 'href' }
@@ -503,27 +517,22 @@ const extractContent = async (url, contentType) => {
         const config = configs[contentType];
         const items = [];
         const seenUrlsOrGuids = new Set();
-        const addedHrefs = new Set();
 
+        // Find elements using selectors
         let combinedElements = [];
         for (const selector of config.selectors) {
             try {
-                $(selector).each((_, elem) => {
-                    const $elem = $(elem);
-                    const href = $elem.attr('href');
-                    const uniqueKey = href;
-
-                    if (uniqueKey && !addedHrefs.has(uniqueKey)) {
-                        combinedElements.push(elem);
-                        addedHrefs.add(uniqueKey);
-                    } else if (!uniqueKey && contentType === 'episodes') {
-                        combinedElements.push(elem);
-                    }
-                });
+                const elements = $(selector);
+                if (elements.length > 0) {
+                    elements.each((_, elem) => combinedElements.push(elem));
+                    break; // Use the first successful selector that finds elements
+                }
             } catch (selectorError) {
                 console.warn(`Selector "${selector}" failed on ${url}: ${selectorError.message}`);
             }
         }
+
+        console.log(`Found ${combinedElements.length} ${contentType} at ${url}`);
 
         if (combinedElements.length === 0) {
             console.warn(`No elements found for ${contentType} at ${url}`);
@@ -534,14 +543,16 @@ const extractContent = async (url, contentType) => {
             const item = {};
             const $elem = $(elem);
 
+            // Process each field
             for (const [field, fieldConfig] of Object.entries(config.fields)) {
                 if (Array.isArray(fieldConfig)) {
+                    // Try multiple field configs
                     for (const subConf of fieldConfig) {
                         try {
                             const target = subConf.selector ? $elem.find(subConf.selector) : $elem;
                             if (target.length > 0) {
                                 let value = subConf.attribute ? target.first().attr(subConf.attribute) : 
-                                          (subConf.text && !subConf.selector ? $elem.text() : target.first().text());
+                                         (subConf.text && !subConf.selector ? $elem.text() : target.first().text());
                                 if (value) {
                                     item[field] = value.replace(/\s+/g, ' ').trim();
                                     break;
@@ -550,6 +561,7 @@ const extractContent = async (url, contentType) => {
                         } catch (subErr) { continue; }
                     }
                 } else {
+                    // Single field config
                     try {
                         const target = fieldConfig.selector ? $elem.find(fieldConfig.selector) : $elem;
                         if (target.length > 0) {
@@ -557,7 +569,9 @@ const extractContent = async (url, contentType) => {
                             if (value !== undefined && value !== null) {
                                 value = String(value).replace(/\s+/g, ' ').trim();
                                 if (field === 'url' && value) {
-                                    try { value = new URL(value, config.base).href.split('?')[0].split('#')[0]; }
+                                    try { 
+                                        value = new URL(value, config.base).href.split('?')[0].split('#')[0]; 
+                                    }
                                     catch (urlError) { value = null; }
                                 }
                                 if (value) item[field] = value;
@@ -567,30 +581,51 @@ const extractContent = async (url, contentType) => {
                 }
             }
 
-            let uniqueKey = null;
-            if (contentType === 'episodes') {
-                if (item.url) {
-                    const guidMatch = item.url.match(/[?&](guid|videoGuid)=([\w-]+)/i) || item.url.match(/\/VOD-([\w-]+)\.htm/);
-                    if (guidMatch && guidMatch[1]) item.guid = guidMatch[1];
-                    else if (guidMatch && guidMatch[2]) item.guid = guidMatch[2];
+            // Handle episodes GUID extraction
+            if (contentType === 'episodes' && item.url) {
+                // Try to extract GUID from URL patterns
+                let guidMatch = item.url.match(/\/VOD-([\w-]+)\.htm/);
+                if (guidMatch && guidMatch[1]) {
+                    item.guid = guidMatch[1];
+                } else {
+                    guidMatch = item.url.match(/[?&](guid|videoGuid)=([\w-]+)/i);
+                    if (guidMatch && guidMatch[2]) {
+                        item.guid = guidMatch[2];
+                    }
                 }
-                if (!item.guid) continue;
-                uniqueKey = item.guid;
-                if (!item.name) item.name = `Episode ${item.guid.substring(0,6)}...`;
-            } else {
-                if (!item.url) continue;
-                uniqueKey = item.url;
-                if (contentType === 'shows') {
-                    item.name = item.name || 'Unknown Show';
-                    item.poster = getValidImage(item.poster);
+                
+                if (!item.guid) {
+                    continue; // Skip episodes without a GUID
                 }
-                if (contentType === 'seasons' && !item.name) {
-                    const seasonMatch = item.url.match(/season-(\d+)/i);
-                    if(seasonMatch) item.name = `Season ${seasonMatch[1]}`;
-                    else item.name = "Unknown Season";
+                
+                if (!item.name) {
+                    item.name = `Episode ${item.guid.substring(0,6)}...`;
                 }
             }
 
+            // Determine unique key for deduplication
+            let uniqueKey = null;
+            if (contentType === 'episodes') {
+                uniqueKey = item.guid;
+            } else {
+                uniqueKey = item.url;
+                
+                // Additional processing for shows and seasons
+                if (contentType === 'shows') {
+                    if (!item.name) item.name = 'Unknown Show';
+                    if (item.poster) item.poster = getValidImage(item.poster);
+                }
+                if (contentType === 'seasons' && !item.name) {
+                    const seasonMatch = item.url.match(/season-(\d+)/i);
+                    if (seasonMatch) {
+                        item.name = `Season ${seasonMatch[1]}`;
+                    } else {
+                        item.name = "Unknown Season";
+                    }
+                }
+            }
+
+            // Add to results if it passes filters and isn't a duplicate
             if (config.filter(item) && uniqueKey && !seenUrlsOrGuids.has(uniqueKey)) {
                 items.push(item);
                 seenUrlsOrGuids.add(uniqueKey);
@@ -816,6 +851,249 @@ const builder = new addonBuilder({
         extra: [{ name: 'search', isRequired: false }]
     }],
     behaviorHints: { adult: false, configurationRequired: false }
+});
+
+// Define catalog handler for the builder
+builder.defineCatalogHandler(async ({ type, id, extra }) => {
+    console.log(`Stremio SDK: catalog request for ${type}/${id}`);
+    
+    if (type !== 'series' || id !== 'mako-vod-shows') {
+        return { metas: [] };
+    }
+
+    let searchTerm = null;
+    if (extra && extra.search) {
+        searchTerm = extra.search;
+    }
+
+    try {
+        // Check if we already have shows in the cache
+        let initialShows = [];
+        if (fs.existsSync(LOCAL_CACHE_FILE)) {
+            initialShows = JSON.parse(fs.readFileSync(LOCAL_CACHE_FILE, 'utf8'));
+        } else {
+            // Only fetch shows if not in cache
+            initialShows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
+            try {
+                fs.writeFileSync(LOCAL_CACHE_FILE, JSON.stringify(initialShows, null, 2));
+            } catch (err) {
+                console.error(`Error saving shows cache: ${err.message}`);
+            }
+        }
+
+        let filteredShows = initialShows;
+        if (searchTerm) {
+            const search = searchTerm.toLowerCase();
+            filteredShows = initialShows.filter(show => {
+                // Try to match by name first
+                if (show.name && show.name.toLowerCase().includes(search)) {
+                    return true;
+                }
+                
+                // If we have metadata, try to match with that too
+                const metadata = globalMetadataCache[show.url];
+                if (metadata && metadata.name && metadata.name.toLowerCase().includes(search)) {
+                    return true;
+                }
+                
+                return false;
+            });
+        }
+
+        // Limit to avoid timeout and memory issues
+        const limitedShows = filteredShows.slice(0, 50);
+        
+        // Queue for background processing
+        filteredShows.forEach((show, index) => {
+            if (!show.url) return;
+            const priority = index < 50 ? 2 : 0;
+            queueMetadataFetch(show.url, priority);
+        });
+
+        // Create meta objects
+        const metas = await Promise.all(limitedShows.map(async (show) => {
+            if (!show.url) return null;
+            
+            try {
+                // Use cached metadata if available
+                const cachedMetadata = globalMetadataCache[show.url];
+                
+                if (cachedMetadata) {
+                    return {
+                        id: `mako:${encodeURIComponent(show.url)}`,
+                        type: 'series',
+                        name: cachedMetadata.name || show.name || 'Loading...',
+                        poster: cachedMetadata.poster || show.poster || DEFAULT_LOGO,
+                        posterShape: 'poster',
+                        background: cachedMetadata.background || cachedMetadata.poster || show.poster || DEFAULT_LOGO,
+                        logo: DEFAULT_LOGO,
+                        description: cachedMetadata.description || 'מאקו VOD',
+                    };
+                }
+                
+                // Otherwise just return basic info
+                return {
+                    id: `mako:${encodeURIComponent(show.url)}`,
+                    type: 'series',
+                    name: show.name || 'Loading...',
+                    poster: show.poster || DEFAULT_LOGO,
+                    posterShape: 'poster',
+                    logo: DEFAULT_LOGO,
+                };
+            } catch (error) {
+                console.error(`Error creating meta for ${show.url}: ${error.message}`);
+                return null;
+            }
+        }));
+
+        return { metas: metas.filter(Boolean) };
+    } catch (err) {
+        console.error('Stremio catalog handler error:', err);
+        return { metas: [] };
+    }
+});
+
+// Define meta handler
+builder.defineMetaHandler(async ({ type, id }) => {
+    console.log(`Stremio SDK: meta request for ${type}/${id}`);
+    
+    if (type !== 'series' || !id.startsWith('mako:')) {
+        return { meta: null };
+    }
+
+    try {
+        const showUrl = decodeURIComponent(id.replace('mako:', ''));
+        if (!showUrl.startsWith(BASE_URL)) {
+            return { meta: null };
+        }
+
+        // Get metadata for the show (will use cache if available)
+        const showDetails = await getMetadata(showUrl);
+        
+        // Queue background fetch for metadata refresh
+        queueMetadataFetch(showUrl, 2);
+        
+        // Get seasons and episodes
+        const seasons = await extractContent(showUrl, 'seasons');
+        let allSeasons = seasons && seasons.length > 0 ? 
+            [{ name: "Season 1", url: showUrl, seasonNum: 1 }, ...seasons.map((s, i) => ({ ...s, seasonNum: i + 2 }))] :
+            [{ name: "Season 1", url: showUrl, seasonNum: 1 }];
+        
+        // Process just the first two seasons to avoid timeouts
+        const seasonsToProcess = allSeasons.slice(0, 2);
+        const allEpisodes = [];
+        
+        for (const season of seasonsToProcess) {
+            const episodes = await extractContent(season.url, 'episodes');
+            if (episodes && episodes.length > 0) {
+                const seasonEpisodes = episodes.map((ep, idx) => ({
+                    ...ep, seasonNum: season.seasonNum, episodeNum: idx + 1
+                }));
+                allEpisodes.push(...seasonEpisodes);
+            }
+            await sleep(200);
+        }
+        
+        // Sort episodes
+        allEpisodes.sort((a, b) => {
+            if (a.seasonNum !== b.seasonNum) return a.seasonNum - b.seasonNum;
+            return a.episodeNum - b.episodeNum;
+        });
+        
+        // Create videos array for Stremio
+        const videos = allEpisodes.map(ep => ({
+            id: `${id}:ep:${ep.guid}`,
+            title: ep.name || `S${ep.seasonNum}E${ep.episodeNum}`,
+            season: ep.seasonNum,
+            episode: ep.episodeNum,
+            released: null,
+        }));
+
+        return {
+            meta: {
+                id,
+                type: 'series',
+                name: showDetails.name,
+                poster: showDetails.poster,
+                posterShape: 'poster',
+                background: showDetails.background,
+                logo: DEFAULT_LOGO,
+                description: showDetails.description,
+                videos
+            }
+        };
+    } catch (err) {
+        console.error('Stremio meta handler error:', err);
+        return { meta: null };
+    }
+});
+
+// Define stream handler
+builder.defineStreamHandler(async ({ type, id }) => {
+    console.log(`Stremio SDK: stream request for ${type}/${id}`);
+    
+    if (type !== 'series' || !id.startsWith('mako:')) {
+        return { streams: [] };
+    }
+
+    try {
+        const parts = id.split(':ep:');
+        if (parts.length !== 2 || !parts[0] || !parts[1]) {
+            return { streams: [] };
+        }
+
+        const showIdRaw = parts[0];
+        const episodeGuid = parts[1];
+        const showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
+        
+        if (!showUrl.startsWith(BASE_URL)) {
+            return { streams: [] };
+        }
+
+        // Find target episode
+        let targetEpisode = null;
+        const seasons = await extractContent(showUrl, 'seasons');
+        let allSeasons = seasons && seasons.length > 0 ? 
+            [{ name: "Season 1", url: showUrl }, ...seasons] :
+            [{ name: "Season 1", url: showUrl }];
+        
+        for (const season of allSeasons) {
+            const episodes = await extractContent(season.url, 'episodes');
+            if (episodes && episodes.length > 0) {
+                const found = episodes.find(ep => ep.guid === episodeGuid);
+                if (found) {
+                    targetEpisode = found;
+                    break;
+                }
+            }
+            if (season !== allSeasons[allSeasons.length - 1]) {
+                await sleep(200);
+            }
+        }
+
+        if (!targetEpisode || !targetEpisode.url) {
+            return { streams: [] };
+        }
+
+        const videoUrl = await getVideoUrl(targetEpisode.url);
+        if (!videoUrl) {
+            return { streams: [] };
+        }
+
+        return {
+            streams: [{
+                url: videoUrl,
+                title: `Play: ${targetEpisode.name || 'Episode'}`,
+                type: 'hls',
+                behaviorHints: {
+                    bingeGroup: `mako-${showUrl}`,
+                }
+            }]
+        };
+    } catch (err) {
+        console.error('Stremio stream handler error:', err);
+        return { streams: [] };
+    }
 });
 
 // --- Express App Setup ---
@@ -1053,64 +1331,71 @@ app.get('/meta/:type/:id.json', async (req, res) => {
         // Queue background fetch for episodes
         queueMetadataFetch(showUrl, 2); // High priority
         
-        // This function needs to be adapted to work with our new approach
-        // It should handle multiple seasons and extract episodes
-        const episodes = await extractContent(showUrl, 'episodes');
+        // Get seasons first
+        const seasons = await extractContent(showUrl, 'seasons');
+        let allSeasons = [];
         
-        // Process episodes for multiple seasons if needed
-        let allEpisodes = episodes || [];
-        try {
-            const seasons = await extractContent(showUrl, 'seasons');
-            if (seasons && seasons.length > 0) {
-                console.log(`Found ${seasons.length} seasons for ${showUrl}`);
-                
-                // Process first 2 seasons only to avoid timeouts
-                const seasonBatch = seasons.slice(0, 2);
-                const seasonPromises = seasonBatch.map(async (season, index) => {
-                    if (!season.url) return [];
-                    
-                    console.log(`Fetching episodes for season ${index + 1}: ${season.name || season.url}`);
-                    const seasonEpisodes = await extractContent(season.url, 'episodes');
-                    
-                    // Add season and episode numbers
-                    return (seasonEpisodes || []).map((ep, i) => ({
-                        ...ep,
-                        seasonNum: index + 1,
-                        episodeNum: i + 1
-                    }));
-                });
-                
-                const seasonEpisodes = await Promise.all(seasonPromises);
-                allEpisodes = [...allEpisodes, ...seasonEpisodes.flat()];
-                
-                // Queue background processing for remaining seasons
-                if (seasons.length > 2) {
-                    console.log(`Queueing remaining ${seasons.length - 2} seasons for background processing`);
-                    // This would require additional background processing logic that 
-                    // we could implement as a separate feature
-                }
-            } else {
-                // If single season, add season and episode numbers
-                allEpisodes = allEpisodes.map((ep, i) => ({
-                    ...ep,
-                    seasonNum: 1,
-                    episodeNum: i + 1
-                }));
-            }
-        } catch (error) {
-            console.error(`Error processing seasons for ${showUrl}:`, error.message);
-            // If we failed to get multiple seasons, at least use what we have
-            allEpisodes = allEpisodes.map((ep, i) => ({
-                ...ep,
-                seasonNum: 1,
-                episodeNum: i + 1
-            }));
+        if (seasons && seasons.length > 0) {
+            console.log(`Found ${seasons.length} seasons for ${showUrl}`);
+            
+            // Add main (root) URL as Season 1 if we have multiple seasons
+            allSeasons = [
+                { name: "Season 1", url: showUrl, seasonNum: 1 },
+                ...seasons.map((season, index) => ({
+                    ...season,
+                    seasonNum: index + 2 // Start from 2 since main URL is season 1
+                }))
+            ];
+        } else {
+            // No seasons found, just use the main URL as the only season
+            allSeasons = [{ name: "Season 1", url: showUrl, seasonNum: 1 }];
         }
         
-        // Organize episodes into seasons
+        // Process episodes for all seasons
+        const allEpisodes = [];
+        
+        // In serverless, limit to first 2 seasons to avoid timeouts
+        const seasonsToProcess = IS_SERVERLESS ? allSeasons.slice(0, 2) : allSeasons;
+        
+        for (const season of seasonsToProcess) {
+            console.log(`Processing season ${season.seasonNum}: ${season.name}`);
+            
+            const episodes = await extractContent(season.url, 'episodes');
+            if (episodes && episodes.length > 0) {
+                // Add season and episode numbers
+                const seasonEpisodes = episodes.map((ep, idx) => ({
+                    ...ep,
+                    seasonNum: season.seasonNum,
+                    episodeNum: idx + 1
+                }));
+                
+                allEpisodes.push(...seasonEpisodes);
+                console.log(`Added ${seasonEpisodes.length} episodes from season ${season.seasonNum}`);
+            } else {
+                console.log(`No episodes found for season ${season.seasonNum}`);
+            }
+            
+            // Add a small delay between season processing
+            await sleep(200);
+        }
+        
+        // If we limited seasons due to serverless, log that info
+        if (IS_SERVERLESS && allSeasons.length > 2) {
+            console.log(`Note: Only processed ${seasonsToProcess.length} of ${allSeasons.length} seasons due to serverless environment limitations`);
+        }
+        
+        // Sort episodes by season and episode number
+        allEpisodes.sort((a, b) => {
+            if (a.seasonNum !== b.seasonNum) return a.seasonNum - b.seasonNum;
+            return a.episodeNum - b.episodeNum;
+        });
+        
+        console.log(`Total episodes found: ${allEpisodes.length}`);
+        
+        // Organize episodes into videos for Stremio
         const videos = allEpisodes.map(ep => ({
             id: `${id}:ep:${ep.guid}`,
-            title: ep.name || `Episode ${ep.episodeNum}`,
+            title: ep.name || `S${ep.seasonNum}E${ep.episodeNum}`,
             season: ep.seasonNum,
             episode: ep.episodeNum,
             released: null,
@@ -1163,21 +1448,43 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             return res.status(400).json({ streams: [], error: 'Invalid show URL in ID' });
         }
 
-        // Find episode URL from GUID - we're not caching episodes yet, so we need to fetch them
-        const episodes = await extractContent(showUrl, 'episodes');
-        let targetEpisode = episodes.find(ep => ep.guid === episodeGuid);
+        console.log(`Looking for episode with GUID: ${episodeGuid} from show: ${showUrl}`);
         
-        // If not found in main page, try looking in seasons
-        if (!targetEpisode) {
-            const seasons = await extractContent(showUrl, 'seasons');
-            if (seasons && seasons.length > 0) {
-                for (const season of seasons) {
-                    if (!season.url) continue;
-                    
-                    const seasonEpisodes = await extractContent(season.url, 'episodes');
-                    targetEpisode = seasonEpisodes.find(ep => ep.guid === episodeGuid);
-                    if (targetEpisode) break;
+        // Find target episode URL by searching through seasons
+        let targetEpisode = null;
+        
+        // First get all seasons
+        const seasons = await extractContent(showUrl, 'seasons');
+        let allSeasons = [];
+        
+        if (seasons && seasons.length > 0) {
+            // Add main URL as Season 1
+            allSeasons = [
+                { name: "Season 1", url: showUrl },
+                ...seasons
+            ];
+        } else {
+            // No seasons found, just use the main URL
+            allSeasons = [{ name: "Season 1", url: showUrl }];
+        }
+        
+        // Search through each season for the episode
+        for (const season of allSeasons) {
+            console.log(`Searching for episode in ${season.name}: ${season.url}`);
+            const episodes = await extractContent(season.url, 'episodes');
+            
+            if (episodes && episodes.length > 0) {
+                const found = episodes.find(ep => ep.guid === episodeGuid);
+                if (found) {
+                    targetEpisode = found;
+                    console.log(`Found episode in ${season.name}: ${found.name}`);
+                    break;
                 }
+            }
+            
+            // Don't sleep after the last season
+            if (season !== allSeasons[allSeasons.length - 1]) {
+                await sleep(200);
             }
         }
 
@@ -1195,7 +1502,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         const result = {
             streams: [{
                 url: videoUrl,
-                title: 'Play (HLS)',
+                title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
