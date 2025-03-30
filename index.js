@@ -1141,14 +1141,41 @@ const backgroundRefresh = async () => {
     try {
         console.log('Starting background refresh...');
         
-        // Get fresh show list
+        // Get fresh show list from index page
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
         console.log(`Found ${shows.length} shows to process`);
         
-        // Update show metadata
+        // Load metadata cache
+        const metadataCache = await loadCache('metadata');
+        
+        // Ensure metadata structure exists
+        if (!metadataCache.metadata) {
+            console.log('Creating new metadata object in cache');
+            metadataCache.metadata = {};
+        }
+        
+        // Count shows needing metadata
+        let needsMetadataCount = 0;
+        for (const show of shows) {
+            if (!show.url) continue;
+            
+            // Check if we need to update metadata for this show
+            const existingMetadata = metadataCache.metadata[show.url];
+            if (!existingMetadata || (Date.now() - (existingMetadata.lastUpdated || 0) > CACHE_TTL_MS)) {
+                needsMetadataCount++;
+            }
+        }
+        
+        console.log(`Found ${needsMetadataCount} shows needing metadata updates out of ${shows.length} total shows`);
+        
+        // Update metadata for all shows
         await updateShowMetadata(shows);
         
-        console.log('Background refresh completed');
+        // Save the updated timestamp
+        metadataCache.timestamp = Date.now();
+        await saveCache(metadataCache, 'metadata');
+        
+        console.log('Background refresh completed successfully');
     } catch (err) {
         console.error('Background refresh error:', err);
     }
@@ -1160,10 +1187,13 @@ const startBackgroundRefresh = () => {
         clearInterval(refreshInterval);
     }
     
-    // Run immediately on startup
-    backgroundRefresh().catch(err => console.error('Initial background refresh failed:', err));
+    console.log('Starting initial background refresh to populate metadata cache...');
+    // Run immediately on startup with high priority
+    setTimeout(() => {
+        backgroundRefresh().catch(err => console.error('Initial background refresh failed:', err));
+    }, 100);
     
-    // Then set up interval
+    // Then set up interval for regular updates
     refreshInterval = setInterval(backgroundRefresh, REFRESH_INTERVAL);
     console.log(`Background refresh scheduled to run every ${REFRESH_INTERVAL/1000/60/60} hours`);
 };
@@ -1200,33 +1230,27 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         let filteredShows = shows;
         if (extra?.search) {
             const search = extra.search.toLowerCase();
-            filteredShows = shows.filter(show => 
-                show.name && show.name.toLowerCase().includes(search)
-            );
+            filteredShows = shows.filter(show => {
+                // Check metadata name first if available
+                if (metadataCache.metadata && metadataCache.metadata[show.url]) {
+                    return metadataCache.metadata[show.url].name.toLowerCase().includes(search);
+                }
+                // Otherwise, use index page name as fallback
+                return show.name && show.name.toLowerCase().includes(search);
+            });
             console.log(`Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
-        // Process shows using metadata cache
-        const processedShows = filteredShows.map(show => {
-            // If metadata cache is fresh, use it
-            if (isMetadataFresh && metadataCache.metadata && metadataCache.metadata[show.url]) {
-                const metadata = metadataCache.metadata[show.url];
-                console.log(`Using cached metadata for ${show.url}: ${metadata.name}`);
-                return {
-                    ...show,
-                    name: metadata.name,
-                    poster: metadata.poster,
-                    background: metadata.background
-                };
-            }
-            
-            // If no metadata or cache is stale, use basic show info
-            console.log(`Using basic show info for ${show.url}: ${show.name}`);
+        // Process shows using metadata cache only
+        const processedShows = filteredShows.filter(show => {
+            return metadataCache.metadata && metadataCache.metadata[show.url];
+        }).map(show => {
+            const metadata = metadataCache.metadata[show.url];
             return {
                 ...show,
-                name: show.name || 'Loading...',
-                poster: show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
-                background: show.background || show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg'
+                name: metadata.name,
+                poster: metadata.poster,
+                background: metadata.background
             };
         });
 
