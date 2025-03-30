@@ -902,7 +902,85 @@ app.get('/manifest.json', (req, res) => {
 // Redirect root to manifest
 app.get('/', (req, res) => res.redirect('/manifest.json'));
 
-// Catalog endpoint
+// --- Background Refresh Constants ---
+const REFRESH_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+const BATCH_SIZE = 10; // Number of shows to process in each batch
+let refreshInterval = null;
+
+// --- Background Refresh Functions ---
+const processShowBatch = async (shows, cache) => {
+    const batchPromises = shows.map(async (show) => {
+        try {
+            if (!show.url) return null;
+            
+            const details = await extractShowName(show.url);
+            if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
+                if (!cache.shows) cache.shows = {};
+                cache.shows[show.url] = {
+                    name: details.name,
+                    poster: details.poster,
+                    background: details.background,
+                    lastUpdated: Date.now()
+                };
+                console.log(`Background: Updated metadata for ${details.name}`);
+            }
+            await sleep(100); // Small delay between requests
+        } catch (err) {
+            console.error(`Background: Error processing show ${show.url}:`, err.message);
+        }
+    });
+
+    await Promise.all(batchPromises);
+};
+
+const backgroundRefresh = async () => {
+    try {
+        console.log('Starting background refresh of show metadata...');
+        const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
+        console.log(`Background: Found ${shows.length} shows to process`);
+
+        const cache = await loadCache();
+        if (!cache) {
+            console.error('Background: Failed to load cache');
+            return;
+        }
+
+        // Process shows in batches
+        for (let i = 0; i < shows.length; i += BATCH_SIZE) {
+            const batch = shows.slice(i, i + BATCH_SIZE);
+            console.log(`Background: Processing batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(shows.length/BATCH_SIZE)}`);
+            await processShowBatch(batch, cache);
+            
+            // Save cache after each batch
+            await saveCache(cache);
+            console.log(`Background: Saved cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
+            
+            await sleep(1000); // Delay between batches
+        }
+
+        console.log('Background: Completed refresh of show metadata');
+    } catch (err) {
+        console.error('Background: Error during refresh:', err);
+    }
+};
+
+const startBackgroundRefresh = () => {
+    if (refreshInterval) {
+        clearInterval(refreshInterval);
+    }
+    
+    // Run immediately on startup
+    backgroundRefresh().catch(err => console.error('Background: Initial refresh failed:', err));
+    
+    // Then set up interval
+    refreshInterval = setInterval(backgroundRefresh, REFRESH_INTERVAL);
+    console.log(`Background refresh scheduled to run every ${REFRESH_INTERVAL/1000/60/60} hours`);
+};
+
+// Start background refresh when the app starts
+startBackgroundRefresh();
+
+// --- Modified Catalog Endpoint ---
 app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
     try {
         const { type, id } = req.params;
@@ -940,7 +1018,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         const initialShows = filteredShows.slice(0, 50);
         const processedShows = [];
 
-        // Process initial shows
+        // Process initial shows using cache
         for (const show of initialShows) {
             try {
                 // Check cache first
@@ -954,27 +1032,8 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
                     continue;
                 }
 
-                // Fetch fresh details
-                const details = await extractShowName(show.url);
-                if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
-                    // Update cache
-                    if (!cache.shows) cache.shows = {};
-                    cache.shows[show.url] = {
-                        name: details.name,
-                        poster: details.poster,
-                        background: details.background,
-                        lastUpdated: Date.now()
-                    };
-                    processedShows.push({
-                        ...show,
-                        name: details.name,
-                        poster: details.poster,
-                        background: details.background
-                    });
-                } else {
-                    processedShows.push(show);
-                }
-                await sleep(100); // Small delay between requests
+                // If not in cache, use basic show info
+                processedShows.push(show);
             } catch (err) {
                 console.error(`Error processing show ${show.url}:`, err.message);
                 processedShows.push(show);
@@ -993,60 +1052,11 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             description: 'מאקו VOD',
         }));
 
-        // Send response
+        // Send response immediately
         console.log(`Catalog: Responding with ${metas.length} metas`);
         res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600');
         res.setHeader('Content-Type', 'application/json');
         res.status(200).json({ metas });
-
-        // Process remaining shows in the background
-        if (filteredShows.length > 50 && !isCacheFresh) {
-            console.log('Starting background processing of remaining shows...');
-            const remainingShows = filteredShows.slice(50);
-            const batchSize = 5;
-            const backgroundProcessedShows = [];
-
-            for (let i = 0; i < remainingShows.length; i += batchSize) {
-                const batch = remainingShows.slice(i, i + batchSize);
-                const batchPromises = batch.map(async (show) => {
-                    try {
-                        if (cache.shows && cache.shows[show.url] && isCacheFresh) {
-                            return null;
-                        }
-
-                        const details = await extractShowName(show.url);
-                        if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
-                            if (!cache.shows) cache.shows = {};
-                            cache.shows[show.url] = {
-                                name: details.name,
-                                poster: details.poster,
-                                background: details.background,
-                                lastUpdated: Date.now()
-                            };
-                            return {
-                                ...show,
-                                name: details.name,
-                                poster: details.poster,
-                                background: details.background
-                            };
-                        }
-                    } catch (err) {
-                        console.error(`Background error processing show ${show.url}:`, err.message);
-                    }
-                    return null;
-                });
-
-                const batchResults = await Promise.all(batchPromises);
-                backgroundProcessedShows.push(...batchResults.filter(Boolean));
-                await sleep(100);
-            }
-
-            // Save updated cache if we processed any shows
-            if (backgroundProcessedShows.length > 0) {
-                console.log(`Background: Processed ${backgroundProcessedShows.length} shows, saving cache...`);
-                await saveCache(cache);
-            }
-        }
 
     } catch (err) {
         console.error('Catalog handler error:', err);
