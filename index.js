@@ -80,42 +80,25 @@ const loadCache = async () => {
 
     if (blob) { // Production with Vercel Blob
         try {
-            console.log(`Attempting to load cache blob with prefix: ${BLOB_CACHE_KEY}`);
-            let mostRecent = null;
-
+            console.log(`Attempting to load cache blob: ${BLOB_CACHE_KEY}`);
+            
             try {
-                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY });
-
-                if (blobs && blobs.length > 0) {
-                    const validBlobs = blobs.filter(b => b.uploadedAt);
-                    if (validBlobs.length > 0) {
-                        mostRecent = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))[0];
-                        console.log(`Found most recent cache blob: ${mostRecent.pathname}, Size: ${mostRecent.size}, URL: ${mostRecent.url}, Uploaded: ${mostRecent.uploadedAt}`);
-
-                        if (mostRecent.size > 0) {
-                            const response = await axios.get(mostRecent.url, { timeout: REQUEST_TIMEOUT_MS + 5000 });
-                            if (typeof response.data === 'object' && response.data !== null) {
-                                loadedData = response.data;
-                                console.log(`Successfully loaded cache from Blob: ${mostRecent.pathname}`);
-                            } else {
-                                console.warn(`Workspaceed cache blob ${mostRecent.pathname} but content was invalid type: ${typeof response.data}`);
-                            }
-                        } else {
-                            console.warn(`Found most recent cache blob ${mostRecent.pathname} but it has size 0. Ignoring.`);
-                        }
-                    } else {
-                        console.log(`No blobs found with prefix ${BLOB_CACHE_KEY} that have valid upload dates.`);
-                    }
+                // Try to get the exact file first
+                const response = await axios.get(`${blob.url}/${BLOB_CACHE_KEY}`, { 
+                    timeout: REQUEST_TIMEOUT_MS + 5000 
+                });
+                
+                if (response.data && typeof response.data === 'object') {
+                    loadedData = response.data;
+                    console.log(`Successfully loaded cache from Blob: ${BLOB_CACHE_KEY}`);
                 } else {
-                    console.log(`No cache blobs found with prefix: ${BLOB_CACHE_KEY}`);
+                    console.warn(`Found cache blob ${BLOB_CACHE_KEY} but content was invalid type: ${typeof response.data}`);
                 }
-            } catch (listOrGetError) {
-                if (listOrGetError.response) {
-                    console.error(`Error fetching cache blob ${mostRecent?.url || 'N/A'}: Status ${listOrGetError.response.status}`, listOrGetError.message);
-                } else if (listOrGetError.message && listOrGetError.message.includes('Failed to list blobs')) {
-                    console.error("Error listing blobs:", listOrGetError.message);
+            } catch (getError) {
+                if (getError.response && getError.response.status === 404) {
+                    console.log(`Cache blob ${BLOB_CACHE_KEY} not found, will initialize new cache.`);
                 } else {
-                    console.error("Error during blob list/fetch operation:", listOrGetError);
+                    console.error(`Error fetching cache blob ${BLOB_CACHE_KEY}:`, getError.message);
                 }
             }
 
@@ -124,7 +107,7 @@ const loadCache = async () => {
                 loadedData = emptyCache;
             }
         } catch (e) {
-            console.error("Outer error during Blob cache loading:", e.message);
+            console.error("Error during Blob cache loading:", e.message);
             loadedData = emptyCache;
         }
     } else { // Local Development
