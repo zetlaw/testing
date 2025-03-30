@@ -56,9 +56,15 @@ let globalMetadataCache = {};
 
 // --- Initialize ---
 // Create cache directory if it doesn't exist
-if (!fs.existsSync(LOCAL_CACHE_DIR)) {
-    console.log(`Creating cache directory: ${LOCAL_CACHE_DIR}`);
-    fs.mkdirSync(LOCAL_CACHE_DIR, { recursive: true });
+try {
+    if (!fs.existsSync(LOCAL_CACHE_DIR)) {
+        console.log(`Creating cache directory: ${LOCAL_CACHE_DIR}`);
+        fs.mkdirSync(LOCAL_CACHE_DIR, { recursive: true });
+    }
+} catch (err) {
+    console.error(`Error creating cache directory: ${err.message}`);
+    // In serverless environments, we can continue without the cache directory
+    // as we'll still have the pre-cached metadata in memory
 }
 
 // Load pre-cached metadata at startup
@@ -93,6 +99,32 @@ try {
     }
 } catch (err) {
     console.error(`Error loading cached metadata: ${err.message}`);
+    // Initialize with empty cache if loading fails
+    globalMetadataCache = {};
+}
+
+// Set a timeout to handle serverless timeouts gracefully
+if (IS_SERVERLESS) {
+    // Most serverless platforms have a 10 second timeout
+    const SERVERLESS_TIMEOUT_MS = 9500; // Just under 10 seconds to be safe
+    
+    setTimeout(() => {
+        console.log('Serverless timeout approaching, clearing queue and freeing resources');
+        // Clear the queue to prevent further processing
+        metadataQueue.length = 0;
+        isProcessingQueue = false;
+        
+        // Free memory in case we're approaching limits
+        if (Object.keys(globalMetadataCache).length > 200) {
+            console.log(`Trimming metadata cache from ${Object.keys(globalMetadataCache).length} to 200 entries`);
+            // Keep only the 200 most recently used entries
+            const entries = Object.entries(globalMetadataCache)
+                .sort((a, b) => (b[1].lastUpdated || 0) - (a[1].lastUpdated || 0))
+                .slice(0, 200);
+            
+            globalMetadataCache = Object.fromEntries(entries);
+        }
+    }, SERVERLESS_TIMEOUT_MS);
 }
 
 // --- Queue Management Functions ---
@@ -143,9 +175,12 @@ async function processMetadataQueue() {
     }
     lastQueueProcess = Date.now();
     
+    // For serverless environments, process a smaller batch to avoid timeouts and memory issues
+    const batchSize = IS_SERVERLESS ? Math.min(3, QUEUE_BATCH_SIZE) : QUEUE_BATCH_SIZE;
+    
     try {
         // Process a batch of items
-        const batch = metadataQueue.slice(0, QUEUE_BATCH_SIZE);
+        const batch = metadataQueue.slice(0, batchSize);
         const promises = batch.map(async (item) => {
             try {
                 console.log(`Fetching metadata for ${item.url} (background)`);
@@ -199,7 +234,21 @@ async function processMetadataQueue() {
         
         // If there are more items, continue processing after a delay
         if (metadataQueue.length > 0) {
-            setTimeout(processMetadataQueue, QUEUE_DELAY_MS);
+            // In serverless environments, we need to be careful about recursive setTimeout calls
+            // as they can cause memory leaks if the function keeps running
+            const nextDelay = IS_SERVERLESS ? 
+                Math.max(QUEUE_DELAY_MS, 2000) : // Longer delay in serverless
+                QUEUE_DELAY_MS;
+                
+            // Limit the queue size in serverless environments to prevent memory issues
+            if (IS_SERVERLESS && metadataQueue.length > 100) {
+                console.log(`Pruning queue from ${metadataQueue.length} to 100 items to prevent memory issues`);
+                // Keep only the highest priority items
+                metadataQueue.sort((a, b) => b.priority - a.priority);
+                metadataQueue.splice(100);
+            }
+            
+            setTimeout(processMetadataQueue, nextDelay);
         }
     }
 }
@@ -824,7 +873,11 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             console.log(`Catalog: Extracted ${initialShows.length} initial show links.`);
             
             // Save to cache
-            fs.writeFileSync(LOCAL_CACHE_FILE, JSON.stringify(initialShows, null, 2));
+            try {
+                fs.writeFileSync(LOCAL_CACHE_FILE, JSON.stringify(initialShows, null, 2));
+            } catch (err) {
+                console.error(`Error saving shows cache: ${err.message}`);
+            }
         }
 
         let filteredShows = initialShows;
@@ -847,28 +900,89 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             console.log(`Catalog: Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
+        // OPTIMIZATION: Limit number of shows to prevent timeouts
+        // Only process the first 50 shows for initial response
+        const MAX_SHOWS_TO_PROCESS = IS_SERVERLESS ? 50 : 100;
+        let showsToProcess = filteredShows;
+        let hasMoreShows = false;
+        
+        if (filteredShows.length > MAX_SHOWS_TO_PROCESS) {
+            showsToProcess = filteredShows.slice(0, MAX_SHOWS_TO_PROCESS);
+            hasMoreShows = true;
+            console.log(`Limiting initial response to ${MAX_SHOWS_TO_PROCESS} shows to avoid timeout`);
+        }
+
+        // Queue all shows for background processing, but prioritize the ones we're displaying now
+        filteredShows.forEach((show, index) => {
+            if (!show.url) return;
+            // High priority for visible items, low for the rest
+            const priority = index < MAX_SHOWS_TO_PROCESS ? 2 : 0;
+            queueMetadataFetch(show.url, priority);
+        });
+
         const metas = [];
-        for (let i = 0; i < filteredShows.length; i += BATCH_SIZE) {
-            const batch = filteredShows.slice(i, i + BATCH_SIZE);
+        // Use a smaller batch size for serverless environments
+        const effectiveBatchSize = IS_SERVERLESS ? 10 : BATCH_SIZE;
+        
+        // Start a timer to make sure we don't exceed time limits
+        const startTime = Date.now();
+        const MAX_PROCESSING_TIME_MS = IS_SERVERLESS ? 5000 : 30000; // 5 seconds for serverless
+        
+        for (let i = 0; i < showsToProcess.length; i += effectiveBatchSize) {
+            // Check if we're approaching the time limit
+            if (Date.now() - startTime > MAX_PROCESSING_TIME_MS) {
+                console.log(`Approaching time limit, returning ${metas.length} shows processed so far`);
+                break;
+            }
+            
+            const batch = showsToProcess.slice(i, i + effectiveBatchSize);
             const batchPromises = batch.map(async (show) => {
                 if (!show.url) return null;
-
-                // Prioritize metadata fetching for current batch
-                queueMetadataFetch(show.url, 2);  // High priority for visible items
                 
                 try {
-                    // Get metadata (will use cache if available)
-                    const metadata = await getMetadata(show.url);
+                    // First check if we have the metadata in cache
+                    const cachedMetadata = globalMetadataCache[show.url];
+                    
+                    if (cachedMetadata) {
+                        // Use the cached metadata
+                        console.log(`Metadata cache hit for ${show.url}`);
+                        return {
+                            id: `mako:${encodeURIComponent(show.url)}`,
+                            type: 'series',
+                            name: cachedMetadata.name || show.name || 'Loading...',
+                            poster: cachedMetadata.poster || show.poster || DEFAULT_LOGO,
+                            posterShape: 'poster',
+                            background: cachedMetadata.background || cachedMetadata.poster || show.poster || DEFAULT_LOGO,
+                            logo: DEFAULT_LOGO,
+                            description: cachedMetadata.description || 'מאקו VOD',
+                        };
+                    }
+                    
+                    // If we're in serverless, don't do direct fetches to avoid timeouts
+                    // just return basic info and let the background job fetch metadata
+                    if (IS_SERVERLESS) {
+                        return {
+                            id: `mako:${encodeURIComponent(show.url)}`,
+                            type: 'series',
+                            name: show.name || 'Loading...',
+                            poster: show.poster || DEFAULT_LOGO,
+                            posterShape: 'poster',
+                            logo: DEFAULT_LOGO,
+                        };
+                    }
+                    
+                    // If not in serverless, we can try a direct fetch
+                    const fetchedMetadata = await getMetadata(show.url);
                     
                     return {
                         id: `mako:${encodeURIComponent(show.url)}`,
                         type: 'series',
-                        name: metadata.name || show.name || 'Loading...',
-                        poster: metadata.poster || show.poster || DEFAULT_LOGO,
+                        name: fetchedMetadata.name || show.name || 'Loading...',
+                        poster: fetchedMetadata.poster || show.poster || DEFAULT_LOGO,
                         posterShape: 'poster',
-                        background: metadata.background || metadata.poster || show.poster || DEFAULT_LOGO,
+                        background: fetchedMetadata.background || fetchedMetadata.poster || show.poster || DEFAULT_LOGO,
                         logo: DEFAULT_LOGO,
-                        description: metadata.description || 'מאקו VOD',
+                        description: fetchedMetadata.description || 'מאקו VOD',
                     };
                 } catch (error) {
                     console.error(`Error creating meta for ${show.url}: ${error.message}`);
@@ -886,28 +1000,30 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             const batchResults = await Promise.all(batchPromises);
             metas.push(...batchResults.filter(Boolean));
 
-            // If we have too many shows and it's a search, just return the first batch
-            if (searchTerm && metas.length > 0 && i + BATCH_SIZE < filteredShows.length) {
+            // If we have too many shows and it's a search, just return what we have so far
+            if (searchTerm && metas.length > 0 && i + effectiveBatchSize < showsToProcess.length && 
+                Date.now() - startTime > MAX_PROCESSING_TIME_MS / 2) {
                 console.log(`Returning ${metas.length} search results before processing all shows to avoid timeout`);
                 break;
             }
 
-            if (i + BATCH_SIZE < filteredShows.length) {
-                await sleep(100);
+            // Small pause between batches
+            if (i + effectiveBatchSize < showsToProcess.length) {
+                await sleep(50); // Reduced from 100ms to 50ms
             }
         }
-        
-        // Queue background fetching for all non-visible shows
-        const visibleUrls = new Set(metas.map(meta => decodeURIComponent(meta.id.replace('mako:', ''))));
-        filteredShows.forEach(show => {
-            if (show.url && !visibleUrls.has(show.url)) {
-                queueMetadataFetch(show.url, 0);  // Low priority for non-visible items
-            }
-        });
+
+        // Add a note about pagination if there are more shows
+        if (hasMoreShows) {
+            console.log(`Returning ${metas.length} shows out of ${filteredShows.length} total. The rest will be processed in the background.`);
+        }
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300');
         res.status(200).json({ metas });
+        
+        // Start processing the queue after response is sent
+        setTimeout(processMetadataQueue, 100);
     } catch (err) {
         console.error('Catalog endpoint error:', err);
         res.status(500).json({ metas: [], error: 'Failed to process catalog request' });
