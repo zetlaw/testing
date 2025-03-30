@@ -1144,7 +1144,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             description: 'מאקו VOD',
         }));
 
-        // Send response
+        // Send response with all shows
         console.log(`Catalog: Responding with ${metas.length} metas`);
         res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600');
         res.setHeader('Content-Type', 'application/json');
