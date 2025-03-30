@@ -639,18 +639,50 @@ const builder = new addonBuilder({
     behaviorHints: { adult: false, configurationRequired: false }
 });
 
-// --- Handler Definitions ---
-builder.defineCatalogHandler(async ({ type, id, extra }) => {
-    if (type !== 'series' || id !== 'mako-vod-shows') {
-        throw new Error('Catalog not found');
-    }
+// --- Express App Setup ---
+const app = express();
+app.use(cors());
 
-    let searchTerm = null;
-    if (extra && extra.search) {
-        searchTerm = extra.search;
-    }
+// Basic logging middleware
+app.use((req, res, next) => {
+    console.log(`Request: ${req.method} ${req.url}`);
+    next();
+});
 
+// --- Express Routes ---
+app.get('/manifest.json', (req, res) => {
     try {
+        const manifest = builder.getInterface();
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=3600');
+        res.send(manifest);
+    } catch (err) {
+        console.error("Error generating manifest:", err);
+        res.status(500).json({ error: 'Failed to generate manifest' });
+    }
+});
+
+app.get('/', (req, res) => res.redirect('/manifest.json'));
+
+app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
+    try {
+        const { type, id } = req.params;
+        let extra = {};
+        if (req.params.extra && req.params.extra.includes('search=')) {
+            try { extra.search = decodeURIComponent(req.params.extra.split('search=')[1].split('/')[0]); }
+            catch (e) { console.warn("Failed to parse search extra:", req.params.extra); }
+        }
+
+        // Directly call the same implementation as in the defineCatalogHandler
+        if (type !== 'series' || id !== 'mako-vod-shows') {
+            return res.status(404).json({ metas: [], error: 'Catalog not found.' });
+        }
+
+        let searchTerm = null;
+        if (extra && extra.search) {
+            searchTerm = extra.search;
+        }
+
         const mainCache = await loadCache('main');
         const metadataCache = await loadCache('metadata');
         const initialShows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
@@ -710,28 +742,32 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
             await saveCache(mainCache, 'main');
         }
 
-        return { metas };
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300');
+        res.status(200).json({ metas });
     } catch (err) {
-        console.error('Catalog handler error:', err);
-        throw err;
+        console.error('Catalog endpoint error:', err);
+        res.status(500).json({ metas: [], error: 'Failed to process catalog request' });
     }
 });
 
-builder.defineMetaHandler(async ({ type, id }) => {
-    if (type !== 'series' || !id.startsWith('mako:')) {
-        throw new Error('Invalid meta ID format');
-    }
-
-    let showUrl;
+app.get('/meta/:type/:id.json', async (req, res) => {
     try {
-        showUrl = decodeURIComponent(id.replace('mako:', ''));
-        if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
-    } catch (e) {
-        console.error('Invalid show URL derived from meta ID:', id);
-        throw new Error('Invalid show URL in ID');
-    }
+        const { type, id } = req.params;
+        // Directly implement the meta handler logic
+        if (type !== 'series' || !id.startsWith('mako:')) {
+            return res.status(404).json({ meta: null, error: 'Meta not found.' });
+        }
 
-    try {
+        let showUrl;
+        try {
+            showUrl = decodeURIComponent(id.replace('mako:', ''));
+            if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
+        } catch (e) {
+            console.error('Invalid show URL derived from meta ID:', id);
+            return res.status(400).json({ meta: null, error: 'Invalid show URL in ID' });
+        }
+
         const metadataCache = await loadCache('metadata');
         const { details: showDetails } = await getOrUpdateShowMetadata(showUrl, metadataCache);
         const { episodes } = await getShowEpisodes(showUrl, metadataCache);
@@ -745,7 +781,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
             released: null,
         }));
 
-        return {
+        const result = {
             meta: {
                 id,
                 type: 'series',
@@ -758,116 +794,6 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 videos
             }
         };
-    } catch (err) {
-        console.error('Meta handler error:', err);
-        throw err;
-    }
-});
-
-builder.defineStreamHandler(async ({ type, id }) => {
-    if (type !== 'series' || !id.startsWith('mako:')) {
-        throw new Error('Invalid stream ID format');
-    }
-
-    const parts = id.split(':ep:');
-    if (parts.length !== 2 || !parts[0] || !parts[1]) {
-        throw new Error('Invalid stream ID format (missing GUID)');
-    }
-
-    const showIdRaw = parts[0];
-    const episodeGuid = parts[1];
-    let showUrl;
-    try {
-        showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
-        if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
-    } catch (e) {
-        console.error('Invalid show URL derived from stream ID:', showIdRaw);
-        throw new Error('Invalid show URL in ID');
-    }
-
-    try {
-        const metadataCache = await loadCache('metadata');
-        const { episodes } = await getShowEpisodes(showUrl, metadataCache);
-        const targetEpisode = episodes.find(ep => ep.guid === episodeGuid);
-
-        if (!targetEpisode || !targetEpisode.url) {
-            console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
-            throw new Error('Episode GUID not found');
-        }
-
-        const videoUrl = await getVideoUrl(targetEpisode.url);
-        if (!videoUrl) {
-            console.error(`Stream handler: getVideoUrl failed for ${targetEpisode.url}`);
-            throw new Error('Failed to retrieve video stream URL');
-        }
-
-        return {
-            streams: [{
-                url: videoUrl,
-                title: 'Play (HLS)',
-                type: 'hls',
-                behaviorHints: {
-                    bingeGroup: `mako-${showUrl}`,
-                }
-            }]
-        };
-    } catch (err) {
-        console.error(`Stream handler error for ID ${id} (GUID: ${episodeGuid}):`, err);
-        throw err;
-    }
-});
-
-// --- Express App Setup ---
-const app = express();
-app.use(cors());
-
-// Basic logging middleware
-app.use((req, res, next) => {
-    console.log(`Request: ${req.method} ${req.url}`);
-    next();
-});
-
-// --- Express Routes ---
-app.get('/manifest.json', (req, res) => {
-    try {
-        const manifest = builder.getInterface();
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=3600');
-        res.send(manifest);
-    } catch (err) {
-        console.error("Error generating manifest:", err);
-        res.status(500).json({ error: 'Failed to generate manifest' });
-    }
-});
-
-app.get('/', (req, res) => res.redirect('/manifest.json'));
-
-app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
-    try {
-        const { type, id } = req.params;
-        let extra = {};
-        if (req.params.extra && req.params.extra.includes('search=')) {
-            try { extra.search = decodeURIComponent(req.params.extra.split('search=')[1].split('/')[0]); }
-            catch (e) { console.warn("Failed to parse search extra:", req.params.extra); }
-        }
-
-        // Use the catalog handler directly
-        const result = await builder.catalogHandler({ type, id, extra });
-
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300');
-        res.status(200).json(result);
-    } catch (err) {
-        console.error('Catalog endpoint error:', err);
-        res.status(500).json({ metas: [], error: 'Failed to process catalog request' });
-    }
-});
-
-app.get('/meta/:type/:id.json', async (req, res) => {
-    try {
-        const { type, id } = req.params;
-        // Use the meta handler directly
-        const result = await builder.metaHandler({ type, id });
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=1800');
@@ -881,14 +807,58 @@ app.get('/meta/:type/:id.json', async (req, res) => {
 app.get('/stream/:type/:id.json', async (req, res) => {
     try {
         const { type, id } = req.params;
-        // Use the stream handler directly
-        const result = await builder.streamHandler({ type, id });
+        // Directly implement the stream handler logic
+        if (type !== 'series' || !id.startsWith('mako:')) {
+            return res.status(404).json({ streams: [], error: 'Stream not found.' });
+        }
+
+        const parts = id.split(':ep:');
+        if (parts.length !== 2 || !parts[0] || !parts[1]) {
+            return res.status(400).json({ streams: [], error: 'Invalid stream ID format (missing GUID)' });
+        }
+
+        const showIdRaw = parts[0];
+        const episodeGuid = parts[1];
+        let showUrl;
+        try {
+            showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
+            if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
+        } catch (e) {
+            console.error('Invalid show URL derived from stream ID:', showIdRaw);
+            return res.status(400).json({ streams: [], error: 'Invalid show URL in ID' });
+        }
+
+        const metadataCache = await loadCache('metadata');
+        const { episodes } = await getShowEpisodes(showUrl, metadataCache);
+        const targetEpisode = episodes.find(ep => ep.guid === episodeGuid);
+
+        if (!targetEpisode || !targetEpisode.url) {
+            console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
+            return res.status(404).json({ streams: [], error: 'Episode GUID not found' });
+        }
+
+        const videoUrl = await getVideoUrl(targetEpisode.url);
+        if (!videoUrl) {
+            console.error(`Stream handler: getVideoUrl failed for ${targetEpisode.url}`);
+            return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
+        }
+
+        const result = {
+            streams: [{
+                url: videoUrl,
+                title: 'Play (HLS)',
+                type: 'hls',
+                behaviorHints: {
+                    bingeGroup: `mako-${showUrl}`,
+                }
+            }]
+        };
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'no-store, max-age=0');
         res.status(200).json(result);
     } catch (err) {
-        console.error('Stream endpoint error:', err);
+        console.error(`Stream endpoint error:`, err);
         res.status(500).json({ streams: [], error: 'Failed to process stream request' });
     }
 });
