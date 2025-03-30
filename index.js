@@ -1243,8 +1243,10 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 url: videoUrl,
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
+                mimeType: 'application/x-mpegURL',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
+                    notWebReady: false
                 }
             }]
         };
@@ -1659,8 +1661,10 @@ app.get('/stream/:type/:id.json', async (req, res) => {
                 url: videoUrl,
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
+                mimeType: 'application/x-mpegURL',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
+                    notWebReady: false
                 }
             }]
         };
