@@ -661,6 +661,20 @@ const getVideoUrl = async (episodeUrl) => {
 
 // --- Stremio Addon Builder & Express App ---
 
+// Create Express app first
+const express = require('express');
+const cors = require('cors');
+const app = express();
+
+// Enable CORS for all origins
+app.use(cors());
+
+// Basic logging middleware
+app.use((req, res, next) => {
+    console.log(`Request: ${req.method} ${req.url}`);
+    next();
+});
+
 // Use manifest details from builder
 const builder = new addonBuilder({
     id: 'org.stremio.mako-vod',
