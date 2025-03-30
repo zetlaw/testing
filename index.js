@@ -912,8 +912,59 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             console.log(`Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
-        // Create initial meta objects with basic info
-        const metas = filteredShows.map(show => ({
+        // Process show details in parallel with rate limiting
+        const batchSize = 5;
+        const processedShows = [];
+
+        for (let i = 0; i < filteredShows.length; i += batchSize) {
+            const batch = filteredShows.slice(i, i + batchSize);
+            const batchPromises = batch.map(async (show) => {
+                // Check cache first
+                if (cache.shows && cache.shows[show.url] && isCacheFresh) {
+                    console.log(`Using cached details for ${show.url}`);
+                    return {
+                        ...show,
+                        name: cache.shows[show.url].name || show.name,
+                        poster: cache.shows[show.url].poster || show.poster,
+                        background: cache.shows[show.url].background || show.poster
+                    };
+                }
+
+                // Fetch fresh details if not in cache or cache is stale
+                console.log(`Fetching fresh details for ${show.url}`);
+                const details = await extractShowName(show.url);
+                if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
+                    // Update cache
+                    if (!cache.shows) cache.shows = {};
+                    cache.shows[show.url] = {
+                        name: details.name,
+                        poster: details.poster,
+                        background: details.background,
+                        lastUpdated: Date.now()
+                    };
+                    return {
+                        ...show,
+                        name: details.name,
+                        poster: details.poster,
+                        background: details.background
+                    };
+                }
+                return show;
+            });
+
+            const batchResults = await Promise.all(batchPromises);
+            processedShows.push(...batchResults);
+            await sleep(100); // Small delay between batches
+        }
+
+        // Save updated cache if we processed any shows
+        if (!isCacheFresh) {
+            console.log(`Saving updated cache with ${processedShows.length} shows`);
+            await saveCache(cache);
+        }
+
+        // Create meta objects with processed show details
+        const metas = processedShows.map(show => ({
             id: `mako:${encodeURIComponent(show.url)}`,
             type: 'series',
             name: show.name || 'Loading...',
@@ -924,59 +975,10 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             description: 'מאקו VOD',
         }));
 
-        // Send response immediately with basic info
-        console.log(`Catalog: Responding with ${metas.length} metas (initial load)`);
+        console.log(`Catalog: Responding with ${metas.length} metas`);
         res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600');
         res.setHeader('Content-Type', 'application/json');
         res.status(200).json({ metas });
-
-        // Process show details in the background
-        if (!isCacheFresh) {
-            console.log('Starting background processing of show details...');
-            const batchSize = 5;
-            const processedShows = [];
-
-            for (let i = 0; i < shows.length; i += batchSize) {
-                const batch = shows.slice(i, i + batchSize);
-                const batchPromises = batch.map(async (show) => {
-                    // Skip if already in cache and fresh
-                    if (cache.shows && cache.shows[show.url] && isCacheFresh) {
-                        return null;
-                    }
-
-                    // Fetch fresh details
-                    console.log(`Background: Fetching details for ${show.url}`);
-                    const details = await extractShowName(show.url);
-                    if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
-                        // Update cache
-                        if (!cache.shows) cache.shows = {};
-                        cache.shows[show.url] = {
-                            name: details.name,
-                            poster: details.poster,
-                            background: details.background,
-                            lastUpdated: Date.now()
-                        };
-                        return {
-                            ...show,
-                            name: details.name,
-                            poster: details.poster,
-                            background: details.background
-                        };
-                    }
-                    return null;
-                });
-
-                const batchResults = await Promise.all(batchPromises);
-                processedShows.push(...batchResults.filter(Boolean));
-                await sleep(100);
-            }
-
-            // Save updated cache if we processed any shows
-            if (processedShows.length > 0) {
-                console.log(`Background: Processed ${processedShows.length} shows, saving cache...`);
-                await saveCache(cache);
-            }
-        }
 
     } catch (err) {
         console.error('Catalog handler error:', err);
