@@ -762,8 +762,8 @@ const getShowEpisodes = async (showUrl, metadataCache) => {
 
 // --- Stremio Addon Builder ---
 const builder = new addonBuilder({
-    id: 'org.stremio.mako-vod.express', // Updated ID slightly
-    version: '1.2.0', // Increment version
+    id: 'org.stremio.mako-vod.express',
+    version: '1.2.0',
     name: 'Mako VOD (Express)',
     description: 'Watch VOD content from Mako (Israeli TV). Uses Vercel Blob caching.',
     logo: DEFAULT_LOGO,
@@ -778,49 +778,16 @@ const builder = new addonBuilder({
     behaviorHints: { adult: false, configurationRequired: false }
 });
 
-// --- Express App Setup ---
-const app = express();
-app.use(cors()); // Enable CORS for all origins
-
-// Basic logging middleware
-app.use((req, res, next) => {
-    console.log(`Request: ${req.method} ${req.url}`);
-    next();
-});
-
-// --- Express Route Handlers ---
-
-// Manifest endpoint
-app.get('/manifest.json', (req, res) => {
-    try {
-        const manifest = builder.getInterface(); // Get manifest data from builder
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=3600'); // Cache for 1 day
-        res.send(manifest);
-    } catch (err) {
-        console.error("Error generating manifest:", err);
-        res.status(500).json({ error: 'Failed to generate manifest' });
-    }
-});
-
-// Redirect root to manifest
-app.get('/', (req, res) => res.redirect('/manifest.json'));
-
-// Catalog endpoint - Using Express Route
-app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
-    const { type, id } = req.params;
-    let extra = {};
-     if (req.params.extra && req.params.extra.includes('search=')) {
-        try { extra.search = decodeURIComponent(req.params.extra.split('search=')[1].split('/')[0]); } // Extract search term more robustly
-        catch (e) { console.warn("Failed to parse search extra:", req.params.extra); }
-    }
-
+// Define the catalog handler
+builder.defineCatalogHandler(async ({ type, id, extra }) => {
     if (type !== 'series' || id !== 'mako-vod-shows') {
-        console.log('Invalid catalog request.');
-        return res.status(404).json({ metas: [], error: 'Catalog not found.' });
+        throw new Error('Catalog not found');
     }
 
-    let cacheNeedsSave = false;
+    let searchTerm = null;
+    if (extra && extra.search) {
+        searchTerm = extra.search;
+    }
 
     try {
         // Load both caches
@@ -833,8 +800,8 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 
         // Apply search filter if present (using initial name)
         let filteredShows = initialShows;
-        if (extra.search) {
-            const search = extra.search.toLowerCase();
+        if (searchTerm) {
+            const search = searchTerm.toLowerCase();
             filteredShows = initialShows.filter(show => show.name && show.name.toLowerCase().includes(search));
             console.log(`Catalog: Found ${filteredShows.length} shows matching initial name search: ${search}`);
         }
@@ -855,11 +822,11 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
                     console.log(`Catalog: Fetching metadata for ${show.url}`);
                     const { details } = await getOrUpdateShowMetadata(show.url, metadataCache);
                     showDetails = details;
-                    cacheNeedsSave = true;
+                    metadataCache.metadata[show.url] = { ...details, lastUpdated: Date.now() };
                 }
 
                 // If searching, perform secondary filter based on fetched name
-                if (extra.search && showDetails.name && !showDetails.name.toLowerCase().includes(extra.search.toLowerCase())) {
+                if (searchTerm && showDetails.name && !showDetails.name.toLowerCase().includes(searchTerm.toLowerCase())) {
                     return null;
                 }
 
@@ -884,34 +851,74 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             }
         }
 
-        console.log(`Catalog: Responding with ${metas.length} metas.`);
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300'); // Cache for 15 mins
-        res.status(200).json({ metas });
+        // Save updated metadata cache
+        await saveCache(metadataCache, 'metadata');
 
-        // Save cache if it was updated
-        if (cacheNeedsSave) {
-            console.log("Catalog: Saving updated metadata cache...");
-            await saveCache(metadataCache, 'metadata');
-        }
-
-        // --- Background Update Check (Optional but good practice) ---
-        // Check freshness of the *main* show list cache
+        // Update main cache if needed
         const isMainCacheFresh = Date.now() - (mainCache.timestamp || 0) < CACHE_TTL_MS;
         if (!isMainCacheFresh && initialShows.length > 0) {
-             console.log("Catalog: Main show list cache is stale. Triggering background update (saving extracted list)...");
-             // Update the main cache with the freshly scraped list
-             mainCache.shows = {}; // Clear old shows if replacing entirely
-             initialShows.forEach(s => { if (s.url) mainCache.shows[s.url] = { name: s.name, poster: s.poster }; });
-             // Save the updated main cache asynchronously
-             saveCache(mainCache, 'main').catch(err => console.error("Background main cache save failed:", err));
+            mainCache.shows = {};
+            initialShows.forEach(s => { if (s.url) mainCache.shows[s.url] = { name: s.name, poster: s.poster }; });
+            await saveCache(mainCache, 'main');
         }
 
+        return { metas };
     } catch (err) {
-        console.error('Catalog handler main error:', err);
-        if (!res.headersSent) {
-            res.status(500).json({ metas: [], error: 'Failed to process catalog request' });
+        console.error('Catalog handler error:', err);
+        throw err;
+    }
+});
+
+// --- Express App Setup ---
+const app = express();
+app.use(cors());
+
+// Basic logging middleware
+app.use((req, res, next) => {
+    console.log(`Request: ${req.method} ${req.url}`);
+    next();
+});
+
+// Manifest endpoint
+app.get('/manifest.json', (req, res) => {
+    try {
+        const manifest = builder.getInterface();
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=3600');
+        res.send(manifest);
+    } catch (err) {
+        console.error("Error generating manifest:", err);
+        res.status(500).json({ error: 'Failed to generate manifest' });
+    }
+});
+
+// Redirect root to manifest
+app.get('/', (req, res) => res.redirect('/manifest.json'));
+
+// Catalog endpoint - Using Express Route
+app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
+    try {
+        const { type, id } = req.params;
+        let extra = {};
+        if (req.params.extra && req.params.extra.includes('search=')) {
+            try { extra.search = decodeURIComponent(req.params.extra.split('search=')[1].split('/')[0]); }
+            catch (e) { console.warn("Failed to parse search extra:", req.params.extra); }
         }
+
+        const result = await builder.getInterface().catalogs.find(cat => 
+            cat.type === type && cat.id === id
+        )?.handler({ type, id, extra });
+
+        if (!result) {
+            return res.status(404).json({ metas: [], error: 'Catalog not found.' });
+        }
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300');
+        res.status(200).json(result);
+    } catch (err) {
+        console.error('Catalog endpoint error:', err);
+        res.status(500).json({ metas: [], error: 'Failed to process catalog request' });
     }
 });
 
