@@ -10,7 +10,7 @@ const BASE_URL = "https://www.mako.co.il";
 const DEFAULT_LOGO = 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
 const DELAY_BETWEEN_REQUESTS_MS = 500;
 const REQUEST_TIMEOUT_MS = 10000;
-const BATCH_SIZE = 20;
+const BATCH_SIZE = 50;
 const PRECACHED_DIR = 'precached';
 const PRECACHED_METADATA_FILE = `${PRECACHED_DIR}/metadata.json`;
 
