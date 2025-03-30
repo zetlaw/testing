@@ -902,65 +902,17 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
         console.log(`Extracted ${shows.length} initial shows`);
 
-        // Process show details in parallel with rate limiting
-        const batchSize = 5; // Process 5 shows at a time
-        const processedShows = [];
-
-        for (let i = 0; i < shows.length; i += batchSize) {
-            const batch = shows.slice(i, i + batchSize);
-            const batchPromises = batch.map(async (show) => {
-                // Check cache first
-                if (cache.shows && cache.shows[show.url] && isCacheFresh) {
-                    console.log(`Using cached details for ${show.url}`);
-                    return {
-                        ...show,
-                        name: cache.shows[show.url].name || show.name,
-                        poster: cache.shows[show.url].poster || show.poster,
-                        background: cache.shows[show.url].background || show.poster
-                    };
-                }
-
-                // Fetch fresh details if not in cache or cache is stale
-                console.log(`Fetching fresh details for ${show.url}`);
-                const details = await extractShowName(show.url);
-                if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
-                    // Update cache
-                    if (!cache.shows) cache.shows = {};
-                    cache.shows[show.url] = {
-                        name: details.name,
-                        poster: details.poster,
-                        background: details.background,
-                        lastUpdated: Date.now()
-                    };
-                    return {
-                        ...show,
-                        name: details.name,
-                        poster: details.poster,
-                        background: details.background
-                    };
-                }
-                return show;
-            });
-
-            const batchResults = await Promise.all(batchPromises);
-            processedShows.push(...batchResults);
-            await sleep(100); // Small delay between batches
-        }
-
-        // Save updated cache
-        await saveCache(cache);
-
         // Filter based on search if needed
-        let filteredShows = processedShows;
+        let filteredShows = shows;
         if (extra?.search) {
             const search = extra.search.toLowerCase();
-            filteredShows = processedShows.filter(show => 
+            filteredShows = shows.filter(show => 
                 show.name && show.name.toLowerCase().includes(search)
             );
             console.log(`Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
-        // Create meta objects
+        // Create initial meta objects with basic info
         const metas = filteredShows.map(show => ({
             id: `mako:${encodeURIComponent(show.url)}`,
             type: 'series',
@@ -972,10 +924,59 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             description: 'מאקו VOD',
         }));
 
-        console.log(`Catalog: Responding with ${metas.length} metas`);
+        // Send response immediately with basic info
+        console.log(`Catalog: Responding with ${metas.length} metas (initial load)`);
         res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600');
         res.setHeader('Content-Type', 'application/json');
         res.status(200).json({ metas });
+
+        // Process show details in the background
+        if (!isCacheFresh) {
+            console.log('Starting background processing of show details...');
+            const batchSize = 5;
+            const processedShows = [];
+
+            for (let i = 0; i < shows.length; i += batchSize) {
+                const batch = shows.slice(i, i + batchSize);
+                const batchPromises = batch.map(async (show) => {
+                    // Skip if already in cache and fresh
+                    if (cache.shows && cache.shows[show.url] && isCacheFresh) {
+                        return null;
+                    }
+
+                    // Fetch fresh details
+                    console.log(`Background: Fetching details for ${show.url}`);
+                    const details = await extractShowName(show.url);
+                    if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
+                        // Update cache
+                        if (!cache.shows) cache.shows = {};
+                        cache.shows[show.url] = {
+                            name: details.name,
+                            poster: details.poster,
+                            background: details.background,
+                            lastUpdated: Date.now()
+                        };
+                        return {
+                            ...show,
+                            name: details.name,
+                            poster: details.poster,
+                            background: details.background
+                        };
+                    }
+                    return null;
+                });
+
+                const batchResults = await Promise.all(batchPromises);
+                processedShows.push(...batchResults.filter(Boolean));
+                await sleep(100);
+            }
+
+            // Save updated cache if we processed any shows
+            if (processedShows.length > 0) {
+                console.log(`Background: Processed ${processedShows.length} shows, saving cache...`);
+                await saveCache(cache);
+            }
+        }
 
     } catch (err) {
         console.error('Catalog handler error:', err);
