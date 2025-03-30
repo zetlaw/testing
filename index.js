@@ -1047,6 +1047,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         // Load metadata cache first
         const metadataCache = await loadCache('metadata');
         const isMetadataFresh = Date.now() - (metadataCache.timestamp || 0) < CACHE_TTL_MS;
+        console.log(`Metadata cache freshness: ${isMetadataFresh ? 'fresh' : 'stale'}`);
 
         // Get initial shows list
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
@@ -1066,6 +1067,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         const processedShows = filteredShows.map(show => {
             const metadata = metadataCache.metadata[show.url];
             if (metadata && isMetadataFresh) {
+                console.log(`Using cached metadata for ${show.url}: ${metadata.name}`);
                 return {
                     ...show,
                     name: metadata.name,
@@ -1073,6 +1075,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
                     background: metadata.background
                 };
             }
+            console.log(`No valid metadata for ${show.url}, skipping`);
             return null;
         }).filter(show => show !== null); // Remove shows without valid metadata
 
