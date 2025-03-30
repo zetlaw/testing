@@ -83,8 +83,11 @@ const ensureCacheStructure = (cacheData, type = 'main') => {
 const loadCache = async (type = 'main') => {
     const now = Date.now();
     // Return recent memory cache immediately (cache memory for 1 min)
-    if (memoryCache && (now - memoryCacheTimestamp < 60 * 1000)) {
-        return type === 'main' ? memoryCache : memoryMetadataCache;
+    if (type === 'main' && memoryCache && (now - memoryCacheTimestamp < 60 * 1000)) {
+        return memoryCache;
+    }
+    if (type === 'metadata' && memoryMetadataCache && (now - memoryMetadataTimestamp < 60 * 1000)) {
+        return memoryMetadataCache;
     }
 
     let loadedData = null;
@@ -1061,43 +1064,77 @@ const processShowMetadata = async (url) => {
 
 const updateShowMetadata = async (shows) => {
     console.log('Starting show metadata update...');
-    let metadataCache = await loadCache('metadata');
     
-    // Ensure metadata structure exists
-    if (!metadataCache.metadata) {
-        metadataCache.metadata = {};
+    if (!shows || !Array.isArray(shows) || shows.length === 0) {
+        console.warn('No shows to update metadata for');
+        return;
     }
     
-    // Process shows in batches
-    for (let i = 0; i < shows.length; i += BATCH_SIZE) {
-        const batch = shows.slice(i, i + BATCH_SIZE);
-        console.log(`Processing metadata batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(shows.length/BATCH_SIZE)}`);
+    try {
+        let metadataCache = await loadCache('metadata');
         
-        const batchPromises = batch.map(async (show) => {
-            if (!show.url) return;
+        // Safety check: ensure metadataCache exists
+        if (!metadataCache) {
+            console.log('Creating new metadata cache object');
+            metadataCache = { timestamp: Date.now(), metadata: {} };
+        }
+        
+        // Ensure metadata structure exists
+        if (!metadataCache.metadata) {
+            console.log('Initializing empty metadata object');
+            metadataCache.metadata = {};
+        }
+        
+        // Process shows in batches
+        for (let i = 0; i < shows.length; i += BATCH_SIZE) {
+            const batch = shows.slice(i, i + BATCH_SIZE);
+            console.log(`Processing metadata batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(shows.length/BATCH_SIZE)}`);
             
-            // Skip if we have fresh metadata
-            const existingMetadata = metadataCache.metadata[show.url];
-            if (existingMetadata && (Date.now() - existingMetadata.lastUpdated < CACHE_TTL_MS)) {
-                console.log(`Using cached metadata for ${show.url}`);
-                return;
+            const batchPromises = batch.map(async (show) => {
+                if (!show || !show.url) {
+                    console.log('Skipping show with missing URL');
+                    return;
+                }
+                
+                // Skip if we have fresh metadata
+                try {
+                    const existingMetadata = metadataCache.metadata[show.url];
+                    if (existingMetadata && (Date.now() - existingMetadata.lastUpdated < CACHE_TTL_MS)) {
+                        console.log(`Using cached metadata for ${show.url}`);
+                        return;
+                    }
+                } catch (err) {
+                    console.error(`Error checking existing metadata: ${err.message}`);
+                }
+                
+                try {
+                    const metadata = await processShowMetadata(show.url);
+                    if (metadata) {
+                        metadataCache.metadata[show.url] = metadata;
+                        console.log(`Updated metadata for ${show.url}: ${metadata.name}`);
+                    }
+                } catch (err) {
+                    console.error(`Error processing metadata for ${show.url}: ${err.message}`);
+                }
+                
+                await sleep(100); // Small delay between requests
+            });
+            
+            try {
+                await Promise.all(batchPromises);
+                await saveCache(metadataCache, 'metadata');
+                console.log(`Saved metadata cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
+            } catch (err) {
+                console.error(`Error processing batch: ${err.message}`);
             }
             
-            const metadata = await processShowMetadata(show.url);
-            if (metadata) {
-                metadataCache.metadata[show.url] = metadata;
-                console.log(`Updated metadata for ${show.url}: ${metadata.name}`);
-            }
-            await sleep(100); // Small delay between requests
-        });
+            await sleep(1000); // Delay between batches
+        }
         
-        await Promise.all(batchPromises);
-        await saveCache(metadataCache, 'metadata');
-        console.log(`Saved metadata cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
-        await sleep(1000); // Delay between batches
+        console.log('Completed show metadata update');
+    } catch (err) {
+        console.error(`Error in updateShowMetadata: ${err.message}`);
     }
-    
-    console.log('Completed show metadata update');
 };
 
 const backgroundRefresh = async () => {
