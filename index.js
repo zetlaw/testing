@@ -34,20 +34,19 @@ if (process.env.NODE_ENV === 'production') {
 
 const BASE_URL = "https://www.mako.co.il";
 const LOCAL_CACHE_FILE = path.join(__dirname, "mako_shows_cache.json"); // Keep for local dev
-const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days in MILLISECONDS (use MS suffix for clarity)
+const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
+const CACHE_TTL_MS = CACHE_TTL; // Alias for consistency
 const DELAY_BETWEEN_REQUESTS_MS = 500; // 0.5 second delay
 const REQUEST_TIMEOUT_MS = 10000; // 10 seconds for axios requests
-const EPISODE_FETCH_TIMEOUT_MS = 20000; // Longer timeout for episode fetches (Add this if needed elsewhere, good practice)
+const EPISODE_FETCH_TIMEOUT_MS = 20000; // Longer timeout for episode fetches
 
-// --- CACHE SPECIFIC CONSTANTS ---
+// --- Cache Storage Constants ---
 const BLOB_CACHE_KEY_PREFIX = 'mako-shows-cache-v1'; // Use as a PREFIX, not exact filename
 const MAX_BLOB_FILES_TO_KEEP = 2; // Number of recent cache blobs to keep
-// const MAX_RETRIES = 3; // This constant wasn't used, can be removed if desired
-
 
 // Headers for requests
 const HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36', // Example updated UA
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
     'Referer': 'https://www.mako.co.il/mako-vod-index',
@@ -58,10 +57,9 @@ const HEADERS = {
 let memoryCache = null;
 let memoryCacheTimestamp = 0;
 
-// Ensures cache object has the necessary structure
+// --- Cache Management Functions ---
 const ensureCacheStructure = (cacheData) => {
     if (typeof cacheData !== 'object' || cacheData === null) {
-        // Return a new object with timestamp 0 for easy freshness checks
         return { timestamp: 0, shows: {}, seasons: {} };
     }
     cacheData.shows = cacheData.shows || {};
@@ -70,17 +68,15 @@ const ensureCacheStructure = (cacheData) => {
     return cacheData;
 };
 
-// --- Cache Management (Modified for Blob) ---
 const loadCache = async () => {
     const now = Date.now();
     // Return recent memory cache immediately (cache memory for 1 min)
     if (memoryCache && (now - memoryCacheTimestamp < 60 * 1000)) {
-        // console.log("Returning recent memory cache.");
         return memoryCache;
     }
 
     let loadedData = null;
-    const emptyCache = ensureCacheStructure(null); // Predefined empty structure
+    const emptyCache = ensureCacheStructure(null);
 
     if (blob) { // Production with Vercel Blob
         try {
@@ -88,31 +84,25 @@ const loadCache = async () => {
             let mostRecent = null;
 
             try {
-                // List blobs using the *prefix*
                 const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY_PREFIX });
 
                 if (blobs && blobs.length > 0) {
-                    // Sort by uploadedAt (more reliable than lastModified)
-                    // Ensure uploadedAt exists and is valid before sorting
                     const validBlobs = blobs.filter(b => b.uploadedAt);
                     if (validBlobs.length > 0) {
-                         mostRecent = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))[0];
-                         console.log(`Found most recent cache blob: ${mostRecent.pathname}, Size: ${mostRecent.size}, URL: ${mostRecent.url}, Uploaded: ${mostRecent.uploadedAt}`);
+                        mostRecent = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))[0];
+                        console.log(`Found most recent cache blob: ${mostRecent.pathname}, Size: ${mostRecent.size}, URL: ${mostRecent.url}, Uploaded: ${mostRecent.uploadedAt}`);
 
-                         // Check if the most recent blob actually has content
-                         if (mostRecent.size > 0) {
-                             const response = await axios.get(mostRecent.url, { timeout: REQUEST_TIMEOUT_MS + 5000 }); // Slightly longer timeout for cache fetch
-                             if (typeof response.data === 'object' && response.data !== null) {
-                                 loadedData = response.data;
-                                 console.log(`Successfully loaded cache from Blob: ${mostRecent.pathname}`);
-                             } else {
-                                 console.warn(`Workspaceed cache blob ${mostRecent.pathname} but content was invalid type: ${typeof response.data}`);
-                                 // Consider deleting the invalid blob? For now, just ignore it.
-                             }
-                         } else {
-                             console.warn(`Found most recent cache blob ${mostRecent.pathname} but it has size 0. Ignoring.`);
-                             // Consider deleting the zero-size blob?
-                         }
+                        if (mostRecent.size > 0) {
+                            const response = await axios.get(mostRecent.url, { timeout: REQUEST_TIMEOUT_MS + 5000 });
+                            if (typeof response.data === 'object' && response.data !== null) {
+                                loadedData = response.data;
+                                console.log(`Successfully loaded cache from Blob: ${mostRecent.pathname}`);
+                            } else {
+                                console.warn(`Workspaceed cache blob ${mostRecent.pathname} but content was invalid type: ${typeof response.data}`);
+                            }
+                        } else {
+                            console.warn(`Found most recent cache blob ${mostRecent.pathname} but it has size 0. Ignoring.`);
+                        }
                     } else {
                         console.log(`No blobs found with prefix ${BLOB_CACHE_KEY_PREFIX} that have valid upload dates.`);
                     }
@@ -120,61 +110,41 @@ const loadCache = async () => {
                     console.log(`No cache blobs found with prefix: ${BLOB_CACHE_KEY_PREFIX}`);
                 }
             } catch (listOrGetError) {
-                // Log specific errors during list or get
-                 if (listOrGetError.response) {
-                     console.error(`Error fetching cache blob ${mostRecent?.url || 'N/A'}: Status ${listOrGetError.response.status}`, listOrGetError.message);
-                 } else if (listOrGetError.message && listOrGetError.message.includes('Failed to list blobs')) {
-                     console.error("Error listing blobs:", listOrGetError.message);
-                     // Could be permissions issue or transient Vercel error
-                 }
-                 else {
-                     console.error("Error during blob list/fetch operation:", listOrGetError);
-                 }
+                if (listOrGetError.response) {
+                    console.error(`Error fetching cache blob ${mostRecent?.url || 'N/A'}: Status ${listOrGetError.response.status}`, listOrGetError.message);
+                } else if (listOrGetError.message && listOrGetError.message.includes('Failed to list blobs')) {
+                    console.error("Error listing blobs:", listOrGetError.message);
+                } else {
+                    console.error("Error during blob list/fetch operation:", listOrGetError);
+                }
             }
 
-            // If loading failed or no valid blob found, initialize
             if (!loadedData) {
                 console.log("Initializing new empty cache (Blob).");
-                loadedData = emptyCache; // Use the predefined structure
-                // Optionally, try to save this initial empty cache (best effort)
-                // This might not be necessary and could clutter storage if list fails often
-                /*
-                try {
-                    const initialPath = `${BLOB_CACHE_KEY_PREFIX}-init-${Date.now()}.json`;
-                    await blob.put(initialPath, JSON.stringify(loadedData), {
-                        access: 'public', contentType: 'application/json'
-                    });
-                    console.log(`Initialized and saved new empty cache to Blob: ${initialPath}`);
-                } catch (saveError) {
-                    console.error("Failed to save initial empty cache to Blob:", saveError.message);
-                }
-                */
+                loadedData = emptyCache;
             }
         } catch (e) {
-            // Catch errors in the outer try block (e.g., if blob object itself is invalid)
             console.error("Outer error during Blob cache loading:", e.message);
-            loadedData = emptyCache; // Fallback
+            loadedData = emptyCache;
         }
     } else { // Local Development
         try {
-            if (fs.existsSync(CACHE_FILE)) {
-                const fileData = fs.readFileSync(CACHE_FILE, 'utf8');
+            if (fs.existsSync(LOCAL_CACHE_FILE)) {
+                const fileData = fs.readFileSync(LOCAL_CACHE_FILE, 'utf8');
                 loadedData = JSON.parse(fileData);
-                console.log(`Loaded cache from local file: ${CACHE_FILE}`);
+                console.log(`Loaded cache from local file: ${LOCAL_CACHE_FILE}`);
             } else {
-                 console.log("Local cache file not found. Initializing empty cache.");
+                console.log("Local cache file not found. Initializing empty cache.");
                 loadedData = emptyCache;
             }
         } catch (e) {
             console.error("Error loading cache from local file:", e.message);
-            loadedData = emptyCache; // Fallback
+            loadedData = emptyCache;
         }
     }
 
-    // Ensure structure and update memory cache
     memoryCache = ensureCacheStructure(loadedData);
-    memoryCacheTimestamp = now; // Timestamp of when it was loaded into memory
-    // console.log(`Cache loaded. Timestamp: ${new Date(memoryCache.timestamp).toISOString()}, Shows: ${Object.keys(memoryCache.shows).length}, Seasons: ${Object.keys(memoryCache.seasons).length}`);
+    memoryCacheTimestamp = now;
     return memoryCache;
 };
 
@@ -243,14 +213,14 @@ const saveCache = async (cache) => {
         }
     } else { // Local Development
         try {
-            // Ensure directory exists (use CACHE_FILE constant for path)
-            const cacheDir = path.dirname(CACHE_FILE);
+            // Ensure directory exists (use LOCAL_CACHE_FILE constant for path)
+            const cacheDir = path.dirname(LOCAL_CACHE_FILE);
             if (!fs.existsSync(cacheDir)) {
                 fs.mkdirSync(cacheDir, { recursive: true });
             }
             // Write the local file
-            fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheToSave, null, 2), 'utf8');
-            console.log(`Cache saved locally (${showCount} shows, ${seasonCount} seasons) to ${CACHE_FILE}`);
+            fs.writeFileSync(LOCAL_CACHE_FILE, JSON.stringify(cacheToSave, null, 2), 'utf8');
+            console.log(`Cache saved locally (${showCount} shows, ${seasonCount} seasons) to ${LOCAL_CACHE_FILE}`);
         } catch (e) {
             console.error("Error saving cache to local file:", e.message);
         }
@@ -278,7 +248,7 @@ const processImageUrl = (url) => {
 const extractShowName = async (url) => {
     try {
         // console.log(`Extracting show name from ${url}`);
-        const response = await axios.get(url, { headers: HEADERS, timeout: REQUEST_TIMEOUT, maxRedirects: 5 });
+        const response = await axios.get(url, { headers: HEADERS, timeout: REQUEST_TIMEOUT_MS, maxRedirects: 5 });
         const $ = cheerio.load(response.data);
         const jsonldTag = $('script[type="application/ld+json"]').html();
 
@@ -348,9 +318,9 @@ const extractShowName = async (url) => {
 
 const extractContent = async (url, contentType) => {
     try {
-        await sleep(DELAY_BETWEEN_REQUESTS);
+        await sleep(DELAY_BETWEEN_REQUESTS_MS);
         // console.log(`Workspaceing ${contentType} from ${url}`);
-        const response = await axios.get(url, { headers: HEADERS, timeout: REQUEST_TIMEOUT });
+        const response = await axios.get(url, { headers: HEADERS, timeout: REQUEST_TIMEOUT_MS });
         const $ = cheerio.load(response.data);
 
         const configs = {
@@ -487,7 +457,7 @@ const extractContent = async (url, contentType) => {
             console.log(`Extracted ${items.length} valid initial show items for ${url}`);
             // Load cache and apply details, but don't start background processing here
             const cache = await loadCache();
-            const cacheIsFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
+            const cacheIsFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
              for (const show of items) {
                  if (cache.shows && cache.shows[show.url]) {
                      const cachedData = cache.shows[show.url];
@@ -530,7 +500,7 @@ const getVideoUrl = async (episodeUrl) => {
     try {
         // 1. Fetch Episode Page HTML
         const episodePageResponse = await axios.get(episodeUrl, {
-            headers: HEADERS, timeout: REQUEST_TIMEOUT, responseType: 'text'
+            headers: HEADERS, timeout: REQUEST_TIMEOUT_MS, responseType: 'text'
         });
         const $ = cheerio.load(episodePageResponse.data);
         const script = $('#__NEXT_DATA__').html();
@@ -551,7 +521,7 @@ const getVideoUrl = async (episodeUrl) => {
         // 4. Fetch as ArrayBuffer and Sanitize Base64 Input
         const playlistResponse = await axios.get(ajaxUrl, {
             headers: { ...HEADERS, 'Accept': 'text/plain' },
-            timeout: REQUEST_TIMEOUT,
+            timeout: REQUEST_TIMEOUT_MS,
             responseType: 'arraybuffer'
         });
         if (!playlistResponse.data || playlistResponse.data.byteLength === 0) { console.error("getVideoUrl: Error - Received empty playlist response buffer"); return null; }
@@ -589,7 +559,7 @@ const getVideoUrl = async (episodeUrl) => {
         // 10. Fetch Entitlement Ticket
         const entitlementResponse = await axios.post(CRYPTO.entitlement.url, encryptedPayload, {
             headers: { ...HEADERS, 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'text/plain' },
-            timeout: REQUEST_TIMEOUT,
+            timeout: REQUEST_TIMEOUT_MS,
             responseType: 'text'
         });
         if (!entitlementResponse.data || !entitlementResponse.data.trim()) { return hlsUrl; }
@@ -716,7 +686,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
         let showBackground = cachedShowData?.background;
         let needsSave = false;
 
-        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
+        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
         if (!cachedShowData || !isCacheFresh) {
             console.log(`Meta: Cache miss or stale for ${showUrl}, fetching details...`);
             const showDetails = await extractShowName(showUrl);
@@ -778,7 +748,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
                         // Increased timeout for episode fetching
                         const response = await axios.get(season.url, { 
                             headers: HEADERS, 
-                            timeout: REQUEST_TIMEOUT * 2 // Double the timeout
+                            timeout: REQUEST_TIMEOUT_MS * 2 // Double the timeout
                         });
                         episodes = await extractContent(season.url, 'episodes');
                         // Cache the episodes
@@ -965,7 +935,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 
         // Load cache first
         const cache = await loadCache();
-        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
+        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
 
         // Get initial shows list
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
@@ -1123,7 +1093,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
         let showBackground = cachedShowData?.background;
         let needsSave = false;
 
-        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
+        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
         if (!cachedShowData || !isCacheFresh) {
              console.log(`Meta: Cache miss or stale for ${showUrl}, fetching details...`);
              const showDetails = await extractShowName(showUrl);
@@ -1185,7 +1155,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
                         // Increased timeout for episode fetching
                         const response = await axios.get(season.url, { 
                             headers: HEADERS, 
-                            timeout: REQUEST_TIMEOUT * 2 // Double the timeout
+                            timeout: REQUEST_TIMEOUT_MS * 2 // Double the timeout
                         });
                         episodes = await extractContent(season.url, 'episodes');
                         // Cache the episodes
@@ -1276,7 +1246,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         try {
             // Load cache first
             const cache = await loadCache();
-            const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
+            const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
 
             console.log(`Stream: Fetching seasons for ${showUrl} to find URL for GUID ${episodeGuid}`);
             const seasons = await extractContent(showUrl, 'seasons');
@@ -1305,7 +1275,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
                             // Increased timeout for episode fetching
                             const response = await axios.get(season.url, { 
                                 headers: HEADERS, 
-                                timeout: REQUEST_TIMEOUT * 2 // Double the timeout
+                                timeout: REQUEST_TIMEOUT_MS * 2 // Double the timeout
                             });
                             episodes = await extractContent(season.url, 'episodes');
                             // Cache the episodes
