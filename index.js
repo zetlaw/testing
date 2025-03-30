@@ -65,49 +65,59 @@ const loadCache = async () => {
     if (blob) { // Only attempt blob if it was initialized successfully
         try {
             console.log(`Attempting to load cache blob: ${BLOB_CACHE_KEY}`);
-            // Use head to check existence and metadata first
-            const headResult = await blob.head(BLOB_CACHE_KEY).catch(err => {
-                if (err.message.includes('404')) {
-                    console.log("Cache blob not found, initializing new cache");
-                    return null;
-                }
-                console.error("Blob head request failed:", err);
-                throw err;
-            });
+            
+            // Initialize empty cache structure
+            const emptyCache = { 
+                timestamp: now, 
+                shows: {}, 
+                seasons: {} 
+            };
 
-            if (headResult && headResult.size > 0) {
-                console.log(`Found cache blob: ${headResult.pathname}, Size: ${headResult.size}, URL: ${headResult.url}`);
-                // Fetch the actual cache data
-                const response = await axios.get(headResult.url, { timeout: 5000 });
-                // Validate fetched data
-                if (typeof response.data !== 'object' || response.data === null) {
-                    console.warn("Fetched cache data is not a valid object, initializing new cache");
-                    memoryCache = { timestamp: now, shows: {}, seasons: {} };
-                } else {
-                    memoryCache = response.data;
-                    // Ensure cache has required structure
-                    if (!memoryCache.shows) memoryCache.shows = {};
-                    if (!memoryCache.seasons) memoryCache.seasons = {};
-                    console.log(`Loaded cache from Blob with ${Object.keys(memoryCache.shows || {}).length} shows and ${Object.keys(memoryCache.seasons || {}).length} seasons`);
+            try {
+                // Try to get the blob
+                const headResult = await blob.head(BLOB_CACHE_KEY);
+                if (headResult && headResult.size > 0) {
+                    console.log(`Found cache blob: ${headResult.pathname}, Size: ${headResult.size}, URL: ${headResult.url}`);
+                    // Fetch the actual cache data
+                    const response = await axios.get(headResult.url, { timeout: 5000 });
+                    // Validate fetched data
+                    if (typeof response.data === 'object' && response.data !== null) {
+                        memoryCache = response.data;
+                        // Ensure cache has required structure
+                        if (!memoryCache.shows) memoryCache.shows = {};
+                        if (!memoryCache.seasons) memoryCache.seasons = {};
+                        console.log(`Loaded cache from Blob with ${Object.keys(memoryCache.shows).length} shows and ${Object.keys(memoryCache.seasons).length} seasons`);
+                        memoryCacheTimestamp = now;
+                        return memoryCache;
+                    }
                 }
-            } else {
-                console.log("Initializing new cache");
-                memoryCache = { timestamp: now, shows: {}, seasons: {} };
-                // Save the initial cache
-                try {
-                    await blob.put(BLOB_CACHE_KEY, JSON.stringify(memoryCache), {
-                        access: 'public',
-                        contentType: 'application/json'
-                    });
-                    console.log("Initialized and saved new cache to Blob storage");
-                } catch (saveError) {
-                    console.error("Failed to save initial cache:", saveError);
+            } catch (headError) {
+                if (!headError.message.includes('404')) {
+                    console.error("Blob head request failed:", headError);
                 }
             }
+
+            // If we get here, either the blob doesn't exist or it's invalid
+            console.log("Initializing new cache");
+            memoryCache = emptyCache;
             memoryCacheTimestamp = now;
+
+            // Try to save the initial cache
+            try {
+                await blob.put(BLOB_CACHE_KEY, JSON.stringify(emptyCache), {
+                    access: 'public',
+                    contentType: 'application/json'
+                });
+                console.log("Initialized and saved new cache to Blob storage");
+            } catch (saveError) {
+                console.error("Failed to save initial cache:", saveError);
+                // Continue even if save fails - we still have the memory cache
+            }
+
             return memoryCache;
+
         } catch (e) {
-            console.error("Error loading cache from Blob storage:", e.message);
+            console.error("Error in loadCache:", e.message);
             // Fallback to empty cache on any error
             memoryCache = { timestamp: now, shows: {}, seasons: {} };
             memoryCacheTimestamp = now;
