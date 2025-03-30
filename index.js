@@ -32,14 +32,18 @@ if (process.env.NODE_ENV === 'production') {
     blob = null;
 }
 
-// Constants
 const BASE_URL = "https://www.mako.co.il";
-const CACHE_FILE = path.join(__dirname, "mako_shows_cache.json"); // Used for local dev
-const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days in MILLISECONDS
-const DELAY_BETWEEN_REQUESTS = 500; // 0.5 second delay between Mako requests
-const MAX_RETRIES = 3; // Not explicitly used with axios default adapter here, but good constant
-const REQUEST_TIMEOUT = 10000; // 10 seconds for axios requests
-const BLOB_CACHE_KEY = 'mako-shows-cache-v1.json'; // Single, consistent cache key
+const LOCAL_CACHE_FILE = path.join(__dirname, "mako_shows_cache.json"); // Keep for local dev
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days in MILLISECONDS (use MS suffix for clarity)
+const DELAY_BETWEEN_REQUESTS_MS = 500; // 0.5 second delay
+const REQUEST_TIMEOUT_MS = 10000; // 10 seconds for axios requests
+const EPISODE_FETCH_TIMEOUT_MS = 20000; // Longer timeout for episode fetches (Add this if needed elsewhere, good practice)
+
+// --- CACHE SPECIFIC CONSTANTS ---
+const BLOB_CACHE_KEY_PREFIX = 'mako-shows-cache-v1'; // Use as a PREFIX, not exact filename
+const MAX_BLOB_FILES_TO_KEEP = 2; // Number of recent cache blobs to keep
+// const MAX_RETRIES = 3; // This constant wasn't used, can be removed if desired
+
 
 // Headers for requests
 const HEADERS = {
@@ -54,100 +58,124 @@ const HEADERS = {
 let memoryCache = null;
 let memoryCacheTimestamp = 0;
 
+// Ensures cache object has the necessary structure
+const ensureCacheStructure = (cacheData) => {
+    if (typeof cacheData !== 'object' || cacheData === null) {
+        // Return a new object with timestamp 0 for easy freshness checks
+        return { timestamp: 0, shows: {}, seasons: {} };
+    }
+    cacheData.shows = cacheData.shows || {};
+    cacheData.seasons = cacheData.seasons || {};
+    cacheData.timestamp = cacheData.timestamp || 0;
+    return cacheData;
+};
+
 // --- Cache Management (Modified for Blob) ---
 const loadCache = async () => {
     const now = Date.now();
-    // Return recent memory cache immediately to avoid multiple fetches within a short time
-    if (memoryCache && (now - memoryCacheTimestamp < 60 * 1000)) { // Cache memory for 1 min
+    // Return recent memory cache immediately (cache memory for 1 min)
+    if (memoryCache && (now - memoryCacheTimestamp < 60 * 1000)) {
+        // console.log("Returning recent memory cache.");
         return memoryCache;
     }
 
-    if (blob) { // Only attempt blob if it was initialized successfully
+    let loadedData = null;
+    const emptyCache = ensureCacheStructure(null); // Predefined empty structure
+
+    if (blob) { // Production with Vercel Blob
         try {
-            console.log(`Attempting to load cache blob: ${BLOB_CACHE_KEY}`);
-            
-            // Initialize empty cache structure
-            const emptyCache = { 
-                timestamp: now, 
-                shows: {}, 
-                seasons: {} 
-            };
+            console.log(`Attempting to load cache blob with prefix: ${BLOB_CACHE_KEY_PREFIX}`);
+            let mostRecent = null;
 
             try {
-                // List blobs to find the most recent one
-                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY });
+                // List blobs using the *prefix*
+                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY_PREFIX });
+
                 if (blobs && blobs.length > 0) {
-                    // Sort by lastModified and get the most recent
-                    const mostRecent = blobs.sort((a, b) => b.lastModified - a.lastModified)[0];
-                    console.log(`Found most recent cache blob: ${mostRecent.pathname}, Size: ${mostRecent.size}, URL: ${mostRecent.url}`);
-                    
-                    // Fetch the actual cache data
-                    const response = await axios.get(mostRecent.url, { timeout: 5000 });
-                    // Validate fetched data
-                    if (typeof response.data === 'object' && response.data !== null) {
-                        memoryCache = response.data;
-                        // Ensure cache has required structure
-                        if (!memoryCache.shows) memoryCache.shows = {};
-                        if (!memoryCache.seasons) memoryCache.seasons = {};
-                        console.log(`Loaded cache from Blob with ${Object.keys(memoryCache.shows).length} shows and ${Object.keys(memoryCache.seasons).length} seasons`);
-                        memoryCacheTimestamp = now;
-                        return memoryCache;
+                    // Sort by uploadedAt (more reliable than lastModified)
+                    // Ensure uploadedAt exists and is valid before sorting
+                    const validBlobs = blobs.filter(b => b.uploadedAt);
+                    if (validBlobs.length > 0) {
+                         mostRecent = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))[0];
+                         console.log(`Found most recent cache blob: ${mostRecent.pathname}, Size: ${mostRecent.size}, URL: ${mostRecent.url}, Uploaded: ${mostRecent.uploadedAt}`);
+
+                         // Check if the most recent blob actually has content
+                         if (mostRecent.size > 0) {
+                             const response = await axios.get(mostRecent.url, { timeout: REQUEST_TIMEOUT_MS + 5000 }); // Slightly longer timeout for cache fetch
+                             if (typeof response.data === 'object' && response.data !== null) {
+                                 loadedData = response.data;
+                                 console.log(`Successfully loaded cache from Blob: ${mostRecent.pathname}`);
+                             } else {
+                                 console.warn(`Workspaceed cache blob ${mostRecent.pathname} but content was invalid type: ${typeof response.data}`);
+                                 // Consider deleting the invalid blob? For now, just ignore it.
+                             }
+                         } else {
+                             console.warn(`Found most recent cache blob ${mostRecent.pathname} but it has size 0. Ignoring.`);
+                             // Consider deleting the zero-size blob?
+                         }
+                    } else {
+                        console.log(`No blobs found with prefix ${BLOB_CACHE_KEY_PREFIX} that have valid upload dates.`);
                     }
+                } else {
+                    console.log(`No cache blobs found with prefix: ${BLOB_CACHE_KEY_PREFIX}`);
                 }
-            } catch (headError) {
-                if (!headError.message.includes('404')) {
-                    console.error("Blob list request failed:", headError);
-                }
+            } catch (listOrGetError) {
+                // Log specific errors during list or get
+                 if (listOrGetError.response) {
+                     console.error(`Error fetching cache blob ${mostRecent?.url || 'N/A'}: Status ${listOrGetError.response.status}`, listOrGetError.message);
+                 } else if (listOrGetError.message && listOrGetError.message.includes('Failed to list blobs')) {
+                     console.error("Error listing blobs:", listOrGetError.message);
+                     // Could be permissions issue or transient Vercel error
+                 }
+                 else {
+                     console.error("Error during blob list/fetch operation:", listOrGetError);
+                 }
             }
 
-            // If we get here, either no blobs exist or they're invalid
-            console.log("Initializing new cache");
-            memoryCache = emptyCache;
-            memoryCacheTimestamp = now;
-
-            // Try to save the initial cache
-            try {
-                await blob.put(BLOB_CACHE_KEY, JSON.stringify(emptyCache), {
-                    access: 'public',
-                    contentType: 'application/json'
-                });
-                console.log("Initialized and saved new cache to Blob storage");
-            } catch (saveError) {
-                console.error("Failed to save initial cache:", saveError);
-                // Continue even if save fails - we still have the memory cache
+            // If loading failed or no valid blob found, initialize
+            if (!loadedData) {
+                console.log("Initializing new empty cache (Blob).");
+                loadedData = emptyCache; // Use the predefined structure
+                // Optionally, try to save this initial empty cache (best effort)
+                // This might not be necessary and could clutter storage if list fails often
+                /*
+                try {
+                    const initialPath = `${BLOB_CACHE_KEY_PREFIX}-init-${Date.now()}.json`;
+                    await blob.put(initialPath, JSON.stringify(loadedData), {
+                        access: 'public', contentType: 'application/json'
+                    });
+                    console.log(`Initialized and saved new empty cache to Blob: ${initialPath}`);
+                } catch (saveError) {
+                    console.error("Failed to save initial empty cache to Blob:", saveError.message);
+                }
+                */
             }
-
-            return memoryCache;
-
         } catch (e) {
-            console.error("Error in loadCache:", e.message);
-            // Fallback to empty cache on any error
-            memoryCache = { timestamp: now, shows: {}, seasons: {} };
-            memoryCacheTimestamp = now;
-            return memoryCache;
+            // Catch errors in the outer try block (e.g., if blob object itself is invalid)
+            console.error("Outer error during Blob cache loading:", e.message);
+            loadedData = emptyCache; // Fallback
         }
-    } else { // Local development or Blob failed to init
+    } else { // Local Development
         try {
             if (fs.existsSync(CACHE_FILE)) {
                 const fileData = fs.readFileSync(CACHE_FILE, 'utf8');
-                const data = JSON.parse(fileData);
-                if (typeof data === 'object' && data !== null) {
-                    memoryCache = data;
-                    // Ensure cache has required structure
-                    if (!memoryCache.shows) memoryCache.shows = {};
-                    if (!memoryCache.seasons) memoryCache.seasons = {};
-                    memoryCacheTimestamp = now;
-                    return memoryCache;
-                }
+                loadedData = JSON.parse(fileData);
+                console.log(`Loaded cache from local file: ${CACHE_FILE}`);
+            } else {
+                 console.log("Local cache file not found. Initializing empty cache.");
+                loadedData = emptyCache;
             }
         } catch (e) {
-            console.error("Error loading cache from file:", e.message);
+            console.error("Error loading cache from local file:", e.message);
+            loadedData = emptyCache; // Fallback
         }
-        // Default to empty if file doesn't exist or fails parsing
-        memoryCache = { timestamp: now, shows: {}, seasons: {} };
-        memoryCacheTimestamp = now;
-        return memoryCache;
     }
+
+    // Ensure structure and update memory cache
+    memoryCache = ensureCacheStructure(loadedData);
+    memoryCacheTimestamp = now; // Timestamp of when it was loaded into memory
+    // console.log(`Cache loaded. Timestamp: ${new Date(memoryCache.timestamp).toISOString()}, Shows: ${Object.keys(memoryCache.shows).length}, Seasons: ${Object.keys(memoryCache.seasons).length}`);
+    return memoryCache;
 };
 
 const saveCache = async (cache) => {
@@ -155,58 +183,76 @@ const saveCache = async (cache) => {
         console.error("Attempted to save invalid cache object.");
         return;
     }
-    
-    // Ensure cache has required structure
-    if (!cache.shows) cache.shows = {};
-    if (!cache.seasons) cache.seasons = {};
-    cache.timestamp = Date.now(); // Ensure timestamp is updated before saving
-    
-    // Update memory cache immediately
-    memoryCache = cache;
-    memoryCacheTimestamp = Date.now();
 
-    if (blob) { // Only attempt blob if it was initialized successfully
+    // Ensure structure and update timestamp *before* saving
+    // Work on a copy to avoid modifying the object passed in unexpectedly elsewhere
+    const cacheToSave = ensureCacheStructure({ ...cache });
+    cacheToSave.timestamp = Date.now();
+
+    // Update memory cache immediately with the latest data
+    memoryCache = cacheToSave;
+    memoryCacheTimestamp = cacheToSave.timestamp;
+
+    const showCount = Object.keys(cacheToSave.shows).length;
+    const seasonCount = Object.keys(cacheToSave.seasons).length;
+
+    if (blob) { // Production with Vercel Blob
         try {
-            console.log(`Attempting to save cache (${Object.keys(cache.shows).length} shows, ${Object.keys(cache.seasons).length} seasons) to Blob: ${BLOB_CACHE_KEY}`);
-            
-            // Save new cache file
-            await blob.put(BLOB_CACHE_KEY, JSON.stringify(cache), {
-                access: 'public',
-                contentType: 'application/json'
-            });
-            console.log("Cache saved successfully to Vercel Blob");
+             // Generate a unique pathname for this save operation using the prefix
+             const uniquePathname = `${BLOB_CACHE_KEY_PREFIX}-${cacheToSave.timestamp}-${Math.random().toString(36).substring(2, 10)}.json`;
+            console.log(`Attempting to save cache (${showCount} shows, ${seasonCount} seasons) to Blob: ${uniquePathname}`);
 
-            // Clean up old cache files
+            // Save the new cache file with the unique name
+            const putResult = await blob.put(uniquePathname, JSON.stringify(cacheToSave), {
+                access: 'public', // Make it publicly accessible for loading via URL
+                contentType: 'application/json'
+                // addPathtoken: false, // Set if you need predictable URLs, but usually handled by unique path
+            });
+            console.log(`Cache saved successfully to Blob: ${putResult.pathname} (URL: ${putResult.url})`);
+
+            // --- Clean up old cache files (best effort) ---
             try {
-                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY });
-                if (blobs && blobs.length > 1) {
-                    // Sort by lastModified, keep the most recent 2 files
-                    const sortedBlobs = blobs.sort((a, b) => b.lastModified - a.lastModified);
-                    const blobsToDelete = sortedBlobs.slice(2);
-                    
-                    // Delete old cache files
-                    for (const oldBlob of blobsToDelete) {
-                        try {
-                            await blob.del(oldBlob.pathname);
-                            console.log(`Deleted old cache file: ${oldBlob.pathname}`);
-                        } catch (delError) {
-                            console.error(`Failed to delete old cache file ${oldBlob.pathname}:`, delError);
-                        }
-                    }
+                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY_PREFIX });
+
+                // Filter out any blobs without valid upload dates before sorting/deleting
+                const validBlobs = blobs.filter(b => b.uploadedAt);
+
+                if (validBlobs && validBlobs.length > MAX_BLOB_FILES_TO_KEEP) {
+                    // Sort by upload time, descending (newest first)
+                    const sortedBlobs = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+                    // Get the blobs to delete (all except the newest N)
+                    const blobsToDelete = sortedBlobs.slice(MAX_BLOB_FILES_TO_KEEP);
+
+                    console.log(`Found ${validBlobs.length} valid blobs, deleting ${blobsToDelete.length} older ones.`);
+
+                    // Delete old blobs using their URLs (required by blob.del)
+                    const deletePromises = blobsToDelete.map(oldBlob =>
+                        blob.del(oldBlob.url) // *** Use the blob's URL for deletion ***
+                           .then(() => console.log(`Deleted old cache file: ${oldBlob.pathname}`))
+                           .catch(delError => console.error(`Failed to delete old cache file ${oldBlob.pathname} (URL: ${oldBlob.url}):`, delError.message))
+                    );
+                    await Promise.all(deletePromises); // Wait for deletions to attempt completion
                 }
             } catch (cleanupError) {
-                console.error("Failed to clean up old cache files:", cleanupError);
+                console.error("Failed during cache cleanup:", cleanupError.message);
             }
         } catch (e) {
-            console.error("Error saving cache to Blob storage:", e.message);
+            console.error(`Error saving cache to Blob storage (Path: ${uniquePathname}):`, e.message);
+            // Log Axios errors specifically if that's the cause
+            if (e.response) { console.error(`Axios Error Details: Status=${e.response.status}`); }
         }
-    } else { // Local development or Blob failed to init
+    } else { // Local Development
         try {
+            // Ensure directory exists (use CACHE_FILE constant for path)
             const cacheDir = path.dirname(CACHE_FILE);
-            if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
-            fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
+            if (!fs.existsSync(cacheDir)) {
+                fs.mkdirSync(cacheDir, { recursive: true });
+            }
+            // Write the local file
+            fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheToSave, null, 2), 'utf8');
+            console.log(`Cache saved locally (${showCount} shows, ${seasonCount} seasons) to ${CACHE_FILE}`);
         } catch (e) {
-            console.error("Error saving cache to file:", e.message);
+            console.error("Error saving cache to local file:", e.message);
         }
     }
 };
