@@ -39,7 +39,7 @@ const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days in MILLISECONDS
 const DELAY_BETWEEN_REQUESTS = 500; // 0.5 second delay between Mako requests
 const MAX_RETRIES = 3; // Not explicitly used with axios default adapter here, but good constant
 const REQUEST_TIMEOUT = 10000; // 10 seconds for axios requests
-const BLOB_CACHE_KEY = 'mako-shows-cache-v1.json'; // Key for Vercel Blob Storage, versioned
+const BLOB_CACHE_KEY = 'mako-shows-cache-v1.json'; // Single, consistent cache key
 
 // Headers for requests
 const HEADERS = {
@@ -82,14 +82,17 @@ const loadCache = async () => {
                 // Validate fetched data
                 if (typeof response.data !== 'object' || response.data === null) {
                     console.warn("Fetched cache data is not a valid object, initializing new cache");
-                    memoryCache = { timestamp: now, shows: {} };
+                    memoryCache = { timestamp: now, shows: {}, seasons: {} };
                 } else {
                     memoryCache = response.data;
-                    console.log(`Loaded cache from Blob with ${Object.keys(memoryCache.shows || {}).length} items`);
+                    // Ensure cache has required structure
+                    if (!memoryCache.shows) memoryCache.shows = {};
+                    if (!memoryCache.seasons) memoryCache.seasons = {};
+                    console.log(`Loaded cache from Blob with ${Object.keys(memoryCache.shows || {}).length} shows and ${Object.keys(memoryCache.seasons || {}).length} seasons`);
                 }
             } else {
                 console.log("Initializing new cache");
-                memoryCache = { timestamp: now, shows: {} };
+                memoryCache = { timestamp: now, shows: {}, seasons: {} };
                 // Save the initial cache
                 try {
                     await blob.put(BLOB_CACHE_KEY, JSON.stringify(memoryCache), {
@@ -106,7 +109,7 @@ const loadCache = async () => {
         } catch (e) {
             console.error("Error loading cache from Blob storage:", e.message);
             // Fallback to empty cache on any error
-            memoryCache = { timestamp: now, shows: {} };
+            memoryCache = { timestamp: now, shows: {}, seasons: {} };
             memoryCacheTimestamp = now;
             return memoryCache;
         }
@@ -117,6 +120,9 @@ const loadCache = async () => {
                 const data = JSON.parse(fileData);
                 if (typeof data === 'object' && data !== null) {
                     memoryCache = data;
+                    // Ensure cache has required structure
+                    if (!memoryCache.shows) memoryCache.shows = {};
+                    if (!memoryCache.seasons) memoryCache.seasons = {};
                     memoryCacheTimestamp = now;
                     return memoryCache;
                 }
@@ -125,7 +131,7 @@ const loadCache = async () => {
             console.error("Error loading cache from file:", e.message);
         }
         // Default to empty if file doesn't exist or fails parsing
-        memoryCache = { timestamp: now, shows: {} };
+        memoryCache = { timestamp: now, shows: {}, seasons: {} };
         memoryCacheTimestamp = now;
         return memoryCache;
     }
@@ -133,22 +139,26 @@ const loadCache = async () => {
 
 const saveCache = async (cache) => {
     if (!cache || typeof cache !== 'object') {
-         console.error("Attempted to save invalid cache object.");
-         return;
+        console.error("Attempted to save invalid cache object.");
+        return;
     }
+    
+    // Ensure cache has required structure
+    if (!cache.shows) cache.shows = {};
+    if (!cache.seasons) cache.seasons = {};
     cache.timestamp = Date.now(); // Ensure timestamp is updated before saving
-    memoryCache = cache; // Update memory cache immediately
+    
+    // Update memory cache immediately
+    memoryCache = cache;
     memoryCacheTimestamp = Date.now();
 
     if (blob) { // Only attempt blob if it was initialized successfully
         try {
-            console.log(`Attempting to save cache (${Object.keys(cache.shows || {}).length} items) to Blob: ${BLOB_CACHE_KEY}`);
+            console.log(`Attempting to save cache (${Object.keys(cache.shows).length} shows, ${Object.keys(cache.seasons).length} seasons) to Blob: ${BLOB_CACHE_KEY}`);
             // Uploading JSON requires stringifying it
             await blob.put(BLOB_CACHE_KEY, JSON.stringify(cache), {
-                access: 'public', // Must be public to allow fetching via URL in loadCache
-                contentType: 'application/json',
-                // Optional: Add caching headers for CDN if blob URL is used directly elsewhere
-                // cacheControl: 'public, max-age=600'
+                access: 'public',
+                contentType: 'application/json'
             });
             console.log("Cache saved successfully to Vercel Blob");
         } catch (e) {
@@ -156,11 +166,9 @@ const saveCache = async (cache) => {
         }
     } else { // Local development or Blob failed to init
         try {
-            // console.log("Saving cache to local file.");
             const cacheDir = path.dirname(CACHE_FILE);
             if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
-            fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8'); // Pretty print local file
-            // console.log("Cache saved successfully to file");
+            fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
         } catch (e) {
             console.error("Error saving cache to file:", e.message);
         }
@@ -1123,29 +1131,81 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         // --- Stream Logic ---
         let episodeUrl = null;
         try {
-            // Efficiently find episode URL - Ideally cache GUID->URL mapping
-            // For now, re-fetch necessary data (can be slow)
-            console.log(`Stream: Re-fetching seasons/episodes for ${showUrl} to find URL for GUID ${episodeGuid}`);
+            // Load cache first
+            const cache = await loadCache();
+            const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
+
+            console.log(`Stream: Fetching seasons for ${showUrl} to find URL for GUID ${episodeGuid}`);
             const seasons = await extractContent(showUrl, 'seasons');
             let episodesFound = [];
+
             if (!seasons || seasons.length === 0) {
                 episodesFound = await extractContent(showUrl, 'episodes');
             } else {
-                for (const season of seasons) { // Fetch all seasons needed to find the episode
-                    const episodes = await extractContent(season.url, 'episodes');
-                    episodesFound.push(...episodes);
-                    if (episodes.some(ep => ep.guid === episodeGuid)) break; // Exit loop once found
-                    await sleep(50); // Small delay
+                // Process seasons in parallel with rate limiting
+                const batchSize = 5; // Process 5 seasons at a time
+                
+                for (let i = 0; i < seasons.length; i += batchSize) {
+                    const batch = seasons.slice(i, i + batchSize);
+                    const batchPromises = batch.map(async (season) => {
+                        const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
+                        console.log(`Stream: Processing season ${seasonNum}: ${season.name || season.url}`);
+                        
+                        // Check cache for season episodes
+                        const cacheKey = `season:${season.url}`;
+                        let episodes = null;
+                        
+                        if (cache.seasons && cache.seasons[cacheKey] && isCacheFresh) {
+                            console.log(`Stream: Using cached episodes for season ${seasonNum}`);
+                            episodes = cache.seasons[cacheKey];
+                        } else {
+                            // Increased timeout for episode fetching
+                            const response = await axios.get(season.url, { 
+                                headers: HEADERS, 
+                                timeout: REQUEST_TIMEOUT * 2 // Double the timeout
+                            });
+                            episodes = await extractContent(season.url, 'episodes');
+                            // Cache the episodes
+                            if (!cache.seasons) cache.seasons = {};
+                            cache.seasons[cacheKey] = episodes;
+                        }
+                        
+                        return episodes;
+                    });
+                    
+                    const batchResults = await Promise.all(batchPromises);
+                    const flatEpisodes = batchResults.flat();
+                    episodesFound.push(...flatEpisodes);
+                    
+                    // Check if we found the episode in this batch
+                    const foundEpisode = flatEpisodes.find(ep => ep.guid === episodeGuid);
+                    if (foundEpisode) {
+                        episodeUrl = foundEpisode.url;
+                        console.log(`Stream handler: Found episode URL in season ${i/batchSize + 1}: ${episodeUrl}`);
+                        break; // Exit the loop once we find the episode
+                    }
+                    
+                    await sleep(50); // Small delay between batches
                 }
             }
-            const episode = episodesFound.find(ep => ep.guid === episodeGuid);
-            if (episode && episode.url) {
-                episodeUrl = episode.url;
-                console.log(`Stream handler: Found episode URL: ${episodeUrl}`);
-            } else {
-                console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
-                return res.status(404).json({ streams: [], err: 'Episode URL not found' });
+
+            // If we haven't found the episode yet, check the episodes we found
+            if (!episodeUrl) {
+                const episode = episodesFound.find(ep => ep.guid === episodeGuid);
+                if (episode && episode.url) {
+                    episodeUrl = episode.url;
+                    console.log(`Stream handler: Found episode URL: ${episodeUrl}`);
+                } else {
+                    console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
+                    return res.status(404).json({ streams: [], err: 'Episode URL not found' });
+                }
             }
+
+            // Save updated cache if needed
+            if (cache.seasons) {
+                await saveCache(cache);
+            }
+
         } catch (error) {
             console.error(`Stream handler: Error finding episode URL: ${error.message}`);
             return res.status(500).json({ streams: [], err: 'Error finding episode URL' });
@@ -1158,9 +1218,8 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             return res.status(500).json({ streams: [], err: 'Failed to retrieve video stream URL' });
         }
         console.log(`Stream handler: Got video URL: ${videoUrl}`);
-        // --- End Stream Logic ---
 
-        const streams = [{ url: videoUrl, title: 'Play' }]; // Simple stream object
+        const streams = [{ url: videoUrl, title: 'Play' }];
 
         console.log(`Stream: Responding with stream for ${episodeGuid}`);
         res.setHeader('Cache-Control', 'no-store, max-age=0'); // Do not cache stream URLs
