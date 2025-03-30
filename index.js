@@ -409,73 +409,126 @@ const extractContent = async (url, contentType) => {
         const items = [];
         const seen = new Set();
 
-        let elements = [];
-        for (const selector of config.selectors) {
-            try {
-                elements = $(selector).toArray();
-                if (elements.length > 0) {
-                    console.log(`Found ${elements.length} elements for ${contentType} with selector: ${selector}`);
-                    break;
-                }
-            } catch(selectorError) {
-                console.warn(`Selector "${selector}" failed: ${selectorError.message}`);
+        // For shows, we want to preserve the original order from the HTML
+        if (contentType === 'shows') {
+            // Find all show links in the order they appear in the HTML
+            const showLinks = [];
+            for (const selector of config.selectors) {
+                $(selector).each((_, elem) => {
+                    const $elem = $(elem);
+                    const href = $elem.attr('href');
+                    if (href && !showLinks.some(link => link.url === href)) {
+                        showLinks.push({
+                            element: $elem,
+                            url: href
+                        });
+                    }
+                });
             }
-        }
-        if (elements.length === 0) console.warn(`No elements found for ${contentType} at ${url}`);
 
-        for (const elem of elements) {
-            const item = {};
-            for (const [field, fieldConfig] of Object.entries(config.fields)) {
-                if (field === 'name' && Array.isArray(fieldConfig)) {
-                    for (const nameConf of fieldConfig) {
-                        try {
-                            const target = nameConf.selector ? $(elem).find(nameConf.selector) : $(elem);
-                            if (target.length) {
-                                let value = nameConf.attribute ? target.first().attr(nameConf.attribute) : (nameConf.text ? $(elem).text() : target.first().text());
-                                if (value) {
-                                    item[field] = value.replace(/\s+/g, ' ').trim();
-                                    break;
-                                }
+            // Process each show in the original order
+            for (const { element, url } of showLinks) {
+                const item = {
+                    url: new URL(url, config.base).href.split('?')[0].split('#')[0]
+                };
+
+                // Extract name using the same logic as before
+                for (const nameConf of config.fields.name) {
+                    try {
+                        const target = nameConf.selector ? element.find(nameConf.selector) : element;
+                        if (target.length) {
+                            let value = nameConf.attribute ? target.first().attr(nameConf.attribute) : (nameConf.text ? element.text() : target.first().text());
+                            if (value) {
+                                item.name = value.replace(/\s+/g, ' ').trim();
+                                break;
                             }
-                        } catch(nameSelectorError){ continue; }
-                    }
-                    continue;
+                        }
+                    } catch(nameSelectorError){ continue; }
                 }
 
+                // Extract poster
                 try {
-                    const selector = fieldConfig.selector;
-                    const attr = fieldConfig.attribute;
-                    const regex = fieldConfig.regex;
-                    const target = selector ? $(elem).find(selector) : $(elem);
+                    item.poster = processImageUrl(
+                        element.find('img').attr('src') ||
+                        element.find('meta[property="og:image"]').attr('content') ||
+                        element.find('meta[name="twitter:image"]').attr('content')
+                    );
+                } catch(posterError) { }
 
-                    if (target.length) {
-                        let value = attr ? target.first().attr(attr) : target.first().text().trim();
-                        if (value && regex && field === 'guid') {
-                            const match = value.match(regex);
-                            if (match) value = match[1];
-                            else value = null;
-                        }
-                        if (value && field === 'url') {
-                            value = new URL(value, config.base).href.split('?')[0].split('#')[0];
-                        }
-                        if (value !== undefined && value !== null && value !== '') item[field] = value;
-                    }
-                } catch(fieldError) { continue; }
-            }
-
-            if (config.filter(item)) {
-                const key = item.guid || item.url;
-                if (key && !seen.has(key)) {
-                    if (contentType === 'shows') {
-                        item.name = item.name || 'Unknown Show';
-                        item.poster = processImageUrl(item.poster) || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
-                        item.background = item.poster;
-                    } else if (contentType === 'episodes' && !item.name) {
-                        item.name = $(elem).text().replace(/\s+/g, ' ').trim() || null;
-                    }
-
+                if (config.filter(item)) {
                     items.push(item);
-                    seen.add(key);
+                }
+            }
+        } else {
+            // For other content types, use the existing logic
+            let elements = [];
+            for (const selector of config.selectors) {
+                try {
+                    elements = $(selector).toArray();
+                    if (elements.length > 0) {
+                        console.log(`Found ${elements.length} elements for ${contentType} with selector: ${selector}`);
+                        break;
+                    }
+                } catch(selectorError) {
+                    console.warn(`Selector "${selector}" failed: ${selectorError.message}`);
+                }
+            }
+            if (elements.length === 0) console.warn(`No elements found for ${contentType} at ${url}`);
+
+            for (const elem of elements) {
+                const item = {};
+                for (const [field, fieldConfig] of Object.entries(config.fields)) {
+                    if (field === 'name' && Array.isArray(fieldConfig)) {
+                        for (const nameConf of fieldConfig) {
+                            try {
+                                const target = nameConf.selector ? $(elem).find(nameConf.selector) : $(elem);
+                                if (target.length) {
+                                    let value = nameConf.attribute ? target.first().attr(nameConf.attribute) : (nameConf.text ? $(elem).text() : target.first().text());
+                                    if (value) {
+                                        item[field] = value.replace(/\s+/g, ' ').trim();
+                                        break;
+                                    }
+                                }
+                            } catch(nameSelectorError){ continue; }
+                        }
+                        continue;
+                    }
+
+                    try {
+                        const selector = fieldConfig.selector;
+                        const attr = fieldConfig.attribute;
+                        const regex = fieldConfig.regex;
+                        const target = selector ? $(elem).find(selector) : $(elem);
+
+                        if (target.length) {
+                            let value = attr ? target.first().attr(attr) : target.first().text().trim();
+                            if (value && regex && field === 'guid') {
+                                const match = value.match(regex);
+                                if (match) value = match[1];
+                                else value = null;
+                            }
+                            if (value && field === 'url') {
+                                value = new URL(value, config.base).href.split('?')[0].split('#')[0];
+                            }
+                            if (value !== undefined && value !== null && value !== '') item[field] = value;
+                        }
+                    } catch(fieldError) { continue; }
+                }
+
+                if (config.filter(item)) {
+                    const key = item.guid || item.url;
+                    if (key && !seen.has(key)) {
+                        if (contentType === 'shows') {
+                            item.name = item.name || 'Unknown Show';
+                            item.poster = processImageUrl(item.poster) || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
+                            item.background = item.poster;
+                        } else if (contentType === 'episodes' && !item.name) {
+                            item.name = $(elem).text().replace(/\s+/g, ' ').trim() || null;
+                        }
+
+                        items.push(item);
+                        seen.add(key);
+                    }
                 }
             }
         }
