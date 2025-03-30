@@ -11,7 +11,9 @@ const { CRYPTO, cryptoOp } = require('./crypto');
 let blob;
 if (process.env.NODE_ENV === 'production') {
     try {
-        blob = require('@vercel/blob');
+        const { put, list } = require('@vercel/blob');
+        blob = { put, list };
+        console.log("Successfully initialized Vercel Blob storage");
     } catch (e) {
         console.error('Failed to load @vercel/blob, cache will not persist:', e.message);
     }
@@ -55,9 +57,9 @@ const loadCache = async () => {
 
         try {
             console.log("Attempting to load cache from Vercel Blob Storage");
-            const blobList = await blob.list();
+            const { blobs } = await blob.list();
             
-            const cacheBlob = blobList.blobs.find(b => b.pathname === BLOB_CACHE_KEY);
+            const cacheBlob = blobs.find(b => b.pathname === BLOB_CACHE_KEY);
             if (cacheBlob) {
                 const cacheUrl = cacheBlob.url;
                 console.log(`Found cache blob at ${cacheUrl}`);
@@ -492,6 +494,10 @@ const extractContent = async (url, contentType) => {
                 }
                 await saveCache(cache);
             }
+
+            // Filter out shows with invalid names
+            items = items.filter(show => show.name && show.name !== 'Unknown Show' && !show.name.includes('יחצ'));
+            console.log(`After filtering, found ${items.length} valid shows`);
         }
 
         return items;
@@ -939,6 +945,16 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         console.log('Processing catalog request:', req.params);
         const { type, id } = req.params;
         
+        // Set CORS headers
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        
+        // Handle OPTIONS request
+        if (req.method === 'OPTIONS') {
+            return res.status(200).end();
+        }
+        
         let extra = {};
         if (req.params.extra) {
             try {
@@ -950,7 +966,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         
         // Check if valid catalog request for our addon
         if (type !== 'series' || id !== 'mako-vod-shows') {
-            return res.send({ metas: [] });
+            return res.status(200).json({ metas: [] });
         }
         
         // Implement simplified catalog logic directly
@@ -984,15 +1000,14 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             }));
 
             res.setHeader('Content-Type', 'application/json');
-            res.send({ metas });
+            res.status(200).json({ metas });
         } catch (error) {
             console.error('Error building catalog:', error);
-            res.setHeader('Content-Type', 'application/json');
-            res.send({ metas: [] });
+            res.status(200).json({ metas: [] });
         }
     } catch (err) {
         console.error('Catalog error:', err);
-        res.status(500).json({ error: 'Error processing catalog request', message: err.message });
+        res.status(200).json({ metas: [] });
     }
 });
 
