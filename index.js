@@ -77,6 +77,8 @@ async function initializeMetadataCache() {
     // First try loading from Vercel Blob (preferred for serverless)
     if (IS_VERCEL && blobClient) {
         try {
+            console.log("BLOB_READ_WRITE_TOKEN exists:", !!process.env.BLOB_READ_WRITE_TOKEN);
+            console.log("IS_VERCEL:", IS_VERCEL);
             console.log("Trying to load metadata from Vercel Blob storage...");
             const { blobs } = await blobClient.list({ prefix: BLOB_METADATA_KEY_PREFIX });
             
