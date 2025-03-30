@@ -925,6 +925,68 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
+// Define the stream handler
+builder.defineStreamHandler(async ({ type, id }) => {
+    if (type !== 'series' || !id.startsWith('mako:')) {
+        throw new Error('Invalid stream ID format');
+    }
+
+    const parts = id.split(':ep:');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        throw new Error('Invalid stream ID format (missing GUID)');
+    }
+
+    const showIdRaw = parts[0];
+    const episodeGuid = parts[1];
+    let showUrl;
+    try {
+        showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
+        if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
+    } catch (e) {
+        console.error('Invalid show URL derived from stream ID:', showIdRaw);
+        throw new Error('Invalid show URL in ID');
+    }
+
+    try {
+        // Load metadata cache (contains season episode lists)
+        const metadataCache = await loadCache('metadata');
+
+        // 1. Get episodes (potentially updating cache)
+        const { episodes } = await getShowEpisodes(showUrl, metadataCache);
+
+        // 2. Find the specific episode by GUID
+        const targetEpisode = episodes.find(ep => ep.guid === episodeGuid);
+
+        if (!targetEpisode || !targetEpisode.url) {
+            console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
+            throw new Error('Episode GUID not found');
+        }
+
+        // 3. Get the final video URL (decryption/entitlement)
+        const videoUrl = await getVideoUrl(targetEpisode.url);
+
+        if (!videoUrl) {
+            console.error(`Stream handler: getVideoUrl failed for ${targetEpisode.url}`);
+            throw new Error('Failed to retrieve video stream URL');
+        }
+
+        // 4. Format Stremio Stream Response
+        return {
+            streams: [{
+                url: videoUrl,
+                title: 'Play (HLS)',
+                type: 'hls',
+                behaviorHints: {
+                    bingeGroup: `mako-${showUrl}`,
+                }
+            }]
+        };
+    } catch (err) {
+        console.error(`Stream handler error for ID ${id} (GUID: ${episodeGuid}):`, err);
+        throw err;
+    }
+});
+
 // --- Express App Setup ---
 const app = express();
 app.use(cors());
@@ -1001,88 +1063,21 @@ app.get('/meta/:type/:id.json', async (req, res) => {
 
 // Stream endpoint - Using Express Route
 app.get('/stream/:type/:id.json', async (req, res) => {
-    const { type, id } = req.params;
-    // console.log('Processing stream request via Express:', { type, id }); // Reduce noise
-
-    if (type !== 'series' || !id.startsWith('mako:')) {
-        return res.status(404).json({ streams: [], error: 'Invalid stream ID format' });
-    }
-
-    const parts = id.split(':ep:');
-    if (parts.length !== 2 || !parts[0] || !parts[1]) {
-         return res.status(400).json({ streams: [], error: 'Invalid stream ID format (missing GUID)' });
-    }
-
-    const showIdRaw = parts[0];
-    const episodeGuid = parts[1];
-    let showUrl;
     try {
-        showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
-        if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
-    } catch (e) {
-        console.error('Invalid show URL derived from stream ID:', showIdRaw);
-        return res.status(400).json({ streams: [], error: 'Invalid show URL in ID' });
-    }
+        const { type, id } = req.params;
+        const result = await builder.getInterface().stream.find(s => 
+            s.type === type
+        )?.handler({ type, id });
 
-    console.log(`Stream handler: Looking for GUID ${episodeGuid} within show ${showUrl}`);
-    let metadataCacheNeedsSave = false; // Track potential cache updates
-
-    try {
-        // Load metadata cache (contains season episode lists)
-        const metadataCache = await loadCache('metadata');
-
-        // 1. Get episodes (potentially updating cache)
-        const { episodes, needsSave } = await getShowEpisodes(showUrl, metadataCache);
-        if (needsSave) metadataCacheNeedsSave = true;
-
-        // 2. Find the specific episode by GUID
-        const targetEpisode = episodes.find(ep => ep.guid === episodeGuid);
-
-        if (!targetEpisode || !targetEpisode.url) {
-            console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
-             // Save cache if needed, even if episode not found
-             if (metadataCacheNeedsSave) {
-                 console.log("Stream: Saving updated metadata cache (episode not found)...");
-                 await saveCache(metadataCache, 'metadata');
-             }
-            return res.status(404).json({ streams: [], error: 'Episode GUID not found.' });
-        }
-         console.log(`Stream handler: Found episode URL: ${targetEpisode.url}`);
-
-        // 3. Get the final video URL (decryption/entitlement)
-        const videoUrl = await getVideoUrl(targetEpisode.url);
-
-        // 4. Save cache if necessary (do this *before* checking videoUrl failure)
-         if (metadataCacheNeedsSave) {
-             console.log("Stream: Saving updated metadata cache...");
-             await saveCache(metadataCache, 'metadata');
-         }
-
-        // 5. Check if video URL retrieval failed
-        if (!videoUrl) {
-            console.error(`Stream handler: getVideoUrl failed for ${targetEpisode.url}`);
-            return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
+        if (!result) {
+            return res.status(404).json({ streams: [], error: 'Stream not found.' });
         }
 
-        // 6. Format Stremio Stream Response
-        const streams = [{
-            url: videoUrl,
-            title: 'Play (HLS)',
-            type: 'hls',
-             behaviorHints: {
-                 bingeGroup: `mako-${showUrl}`,
-                 // Add proxy headers if needed via Vercel config or another layer
-                 // headers: { "User-Agent": "Stremio" } // Example
-             }
-        }];
-
-        console.log(`Stream: Responding with stream for GUID ${episodeGuid}`);
         res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Cache-Control', 'no-store, max-age=0'); // Do not cache stream URLs
-        res.status(200).json({ streams });
-
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+        res.status(200).json(result);
     } catch (err) {
-        console.error(`Stream handler error for ID ${id} (GUID: ${episodeGuid}):`, err);
+        console.error('Stream endpoint error:', err);
         res.status(500).json({ streams: [], error: 'Failed to process stream request' });
     }
 });
