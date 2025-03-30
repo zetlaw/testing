@@ -50,47 +50,93 @@ const extractShowNameAndImages = async (url) => {
         let background = null;
         let description = 'מאקו VOD';
         let seasons = [];
+        let nameSource = "unknown";
 
         // Try JSON-LD - This is our primary source of information
         try {
-            const jsonldTag = $('script[type="application/ld+json"]').html();
-            if (jsonldTag) {
-                const data = JSON.parse(jsonldTag);
+            // First try methods that might extract the data
+            let jsonldData = null;
+            const jsonldScripts = $('script[type="application/ld+json"]');
+            
+            if (jsonldScripts.length > 0) {
+                // First approach: using children[0].data (most reliable)
+                try {
+                    if (jsonldScripts[0].children && jsonldScripts[0].children.length > 0) {
+                        jsonldData = JSON.parse(jsonldScripts[0].children[0].data);
+                    }
+                } catch (e) {
+                    console.log(`Failed with children approach: ${e.message}`);
+                }
                 
-                // Check if it's a TVSeries directly
-                if (data['@type'] === 'TVSeries') {
-                    name = data.name; // Directly use name from JSON-LD
-                    description = data.description || description;
+                // Second approach: using .html() if first approach failed
+                if (!jsonldData) {
+                    try {
+                        const jsonldHtml = jsonldScripts.html();
+                        if (jsonldHtml) {
+                            jsonldData = JSON.parse(jsonldHtml);
+                        }
+                    } catch (e) {
+                        console.log(`Failed with html approach: ${e.message}`);
+                    }
+                }
+                
+                // If both failed, try each script element
+                if (!jsonldData) {
+                    for (let i = 0; i < jsonldScripts.length; i++) {
+                        try {
+                            const content = $(jsonldScripts[i]).html();
+                            if (content) {
+                                jsonldData = JSON.parse(content);
+                                break;
+                            }
+                        } catch (e) {
+                            continue;
+                        }
+                    }
+                }
+            }
+            
+            if (jsonldData) {
+                // IMPORTANT: Use case-insensitive type checking
+                const type = jsonldData['@type'] && jsonldData['@type'].toLowerCase();
+                
+                // Check for TVSeries (case insensitive)
+                if (type === 'tvseries' || type === 'series' || type === 'videoobject') {
+                    name = jsonldData.name;
+                    nameSource = "json-ld";
+                    description = jsonldData.description || description;
                     
-                    if (data.image) {
-                        poster = Array.isArray(data.image) ? data.image[0] : data.image;
+                    if (jsonldData.image) {
+                        poster = Array.isArray(jsonldData.image) ? jsonldData.image[0] : jsonldData.image;
                     }
                     
-                    if (data.containsSeason && Array.isArray(data.containsSeason)) {
-                        seasons = data.containsSeason;
+                    if (jsonldData.containsSeason && Array.isArray(jsonldData.containsSeason)) {
+                        seasons = jsonldData.containsSeason;
                     }
                 } 
                 // If it points to a TV series
-                else if (data.partOfTVSeries) {
-                    name = data.partOfTVSeries.name;
-                    description = data.partOfTVSeries.description || description;
+                else if (jsonldData.partOfTVSeries) {
+                    const series = jsonldData.partOfTVSeries;
+                    name = series.name;
+                    nameSource = "json-ld";
+                    description = series.description || description;
                     
-                    if (data.partOfTVSeries.image) {
-                        poster = Array.isArray(data.partOfTVSeries.image) ? 
-                                 data.partOfTVSeries.image[0] : data.partOfTVSeries.image;
+                    if (series.image) {
+                        poster = Array.isArray(series.image) ? series.image[0] : series.image;
                     }
                     
-                    if (data.partOfTVSeries.containsSeason && Array.isArray(data.partOfTVSeries.containsSeason)) {
-                        seasons = data.partOfTVSeries.containsSeason;
+                    if (series.containsSeason && Array.isArray(series.containsSeason)) {
+                        seasons = series.containsSeason;
                     }
                 }
-                // If it's a TVSeason
-                else if (data['@type'] === 'TVSeason') {
-                    name = data.name;
-                    description = data.description || description;
+                // If it's a TVSeason (case insensitive)
+                else if (type === 'tvseason') {
+                    name = jsonldData.name;
+                    nameSource = "json-ld";
+                    description = jsonldData.description || description;
                     
-                    if (data.image) {
-                        poster = Array.isArray(data.image) ? data.image[0] : data.image;
+                    if (jsonldData.image) {
+                        poster = Array.isArray(jsonldData.image) ? jsonldData.image[0] : jsonldData.image;
                     }
                 }
 
@@ -111,6 +157,7 @@ const extractShowNameAndImages = async (url) => {
             const ogTitle = $('meta[property="og:title"]').attr('content');
             const h1Title = $('h1').first().text();
             name = ogTitle || h1Title;
+            nameSource = "html";
             if (name) name = name.replace(/\s+/g, ' ').trim();
         }
 
@@ -140,7 +187,8 @@ const extractShowNameAndImages = async (url) => {
             poster: poster,
             background: background,
             description: description,
-            seasons: seasons.length
+            seasons: seasons.length,
+            nameSource: nameSource
         };
     } catch (e) {
         console.error(`Error extracting show details from ${url}:`, e.message);
@@ -149,7 +197,8 @@ const extractShowNameAndImages = async (url) => {
             poster: DEFAULT_LOGO,
             background: DEFAULT_LOGO,
             description: 'Error loading description',
-            seasons: 0
+            seasons: 0,
+            nameSource: "error"
         };
     }
 };
@@ -293,7 +342,13 @@ async function main() {
         timestamp: Date.now(),
         metadata: {},
         seasons: {},
-        shows: {}  // Include shows data within the metadata file
+        shows: {},  // Include shows data within the metadata file
+        stats: {
+            jsonld: 0,
+            html: 0,
+            error: 0,
+            unknown: 0
+        }
     };
     
     let completedShows = 0;
@@ -308,6 +363,11 @@ async function main() {
             const details = await extractShowNameAndImages(show.url);
             
             if (details.name !== 'Error Loading Show' && details.name !== 'Unknown Show') {
+                // Track name source stats
+                if (details.nameSource) {
+                    metadataCache.stats[details.nameSource] = (metadataCache.stats[details.nameSource] || 0) + 1;
+                }
+                
                 // Store full metadata
                 metadataCache.metadata[show.url] = {
                     ...details,
@@ -320,9 +380,10 @@ async function main() {
                     poster: details.poster 
                 };
                 
-                console.log(`✓ Successfully fetched metadata for: ${details.name}`);
+                console.log(`✓ Successfully fetched metadata for: ${details.name} [Source: ${details.nameSource}]`);
                 return true;
             } else {
+                metadataCache.stats.error = (metadataCache.stats.error || 0) + 1;
                 console.warn(`✗ Failed to fetch metadata for: ${show.url}`);
                 return false;
             }
@@ -334,6 +395,7 @@ async function main() {
         // Save progress after each batch
         fs.writeFileSync(METADATA_FILE, JSON.stringify(metadataCache, null, 2), 'utf8');
         console.log(`Progress: ${completedShows}/${totalShows} (${Math.round(completedShows/totalShows*100)}%)`);
+        console.log(`Name sources so far: JSON-LD: ${metadataCache.stats.jsonld}, HTML: ${metadataCache.stats.html}, Errors: ${metadataCache.stats.error}, Unknown: ${metadataCache.stats.unknown}`);
         
         if (i + BATCH_SIZE < initialShows.length) {
             // Add a delay between batches to avoid hammering the server
@@ -345,6 +407,11 @@ async function main() {
     // Final save
     fs.writeFileSync(METADATA_FILE, JSON.stringify(metadataCache, null, 2), 'utf8');
     console.log(`\nDownload complete! Metadata saved for ${completedShows}/${totalShows} shows.`);
+    console.log(`Name extraction statistics:
+- JSON-LD: ${metadataCache.stats.jsonld} (${Math.round((metadataCache.stats.jsonld/totalShows)*100)}%)
+- HTML fallback: ${metadataCache.stats.html} (${Math.round((metadataCache.stats.html/totalShows)*100)}%)
+- Errors: ${metadataCache.stats.error} (${Math.round((metadataCache.stats.error/totalShows)*100)}%)
+- Unknown: ${metadataCache.stats.unknown} (${Math.round((metadataCache.stats.unknown/totalShows)*100)}%)`);
     console.log(`Metadata file: ${METADATA_FILE}`);
 }
 

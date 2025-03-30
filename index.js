@@ -220,6 +220,7 @@ const extractShowNameAndImages = async (url) => {
         let background = null;
         let description = 'מאקו VOD';
         let seasons = [];
+        let nameSource = "unknown";
 
         // Try JSON-LD - This is our primary source of information
         try {
@@ -230,6 +231,7 @@ const extractShowNameAndImages = async (url) => {
                 // Direct extraction of name if it's a TVSeries (highest priority)
                 if (data['@type'] === 'TVSeries' && data.name) {
                     name = data.name; // Directly use name property
+                    nameSource = "json-ld";
                     description = data.description || description;
                     
                     if (data.image) {
@@ -243,6 +245,7 @@ const extractShowNameAndImages = async (url) => {
                 // If it points to a TV series
                 else if (data.partOfTVSeries) {
                     name = data.partOfTVSeries.name;
+                    nameSource = "json-ld";
                     description = data.partOfTVSeries.description || description;
                     
                     if (data.partOfTVSeries.image) {
@@ -257,6 +260,7 @@ const extractShowNameAndImages = async (url) => {
                 // If it's a TVSeason
                 else if (data['@type'] === 'TVSeason') {
                     name = data.name;
+                    nameSource = "json-ld";
                     description = data.description || description;
                     
                     if (data.image) {
@@ -281,6 +285,7 @@ const extractShowNameAndImages = async (url) => {
             const ogTitle = $('meta[property="og:title"]').attr('content');
             const h1Title = $('h1').first().text();
             name = ogTitle || h1Title;
+            nameSource = "html";
             if (name) name = name.replace(/\s+/g, ' ').trim();
         }
 
@@ -310,7 +315,8 @@ const extractShowNameAndImages = async (url) => {
             poster: poster,
             background: background,
             description: description,
-            seasons: seasons.length
+            seasons: seasons.length,
+            nameSource: nameSource
         };
     } catch (e) {
         console.error(`Error extracting show details from ${url}:`, e.message);
@@ -319,7 +325,8 @@ const extractShowNameAndImages = async (url) => {
             poster: DEFAULT_LOGO,
             background: DEFAULT_LOGO,
             description: 'Error loading description',
-            seasons: 0
+            seasons: 0,
+            nameSource: "error"
         };
     }
 };
@@ -585,7 +592,7 @@ const getOrUpdateShowMetadata = async (showUrl, metadataCache) => {
                 poster: details.poster 
             };
             needsSave = true;
-            console.log(`Updated and cached metadata for: ${showUrl}`);
+            console.log(`Updated and cached metadata for: ${showUrl} [Source: ${details.nameSource}]`);
         } else {
             details = cachedData || details;
             console.warn(`Failed to fetch fresh metadata for ${showUrl}. Using stale/error data.`);
