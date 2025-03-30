@@ -41,8 +41,8 @@ const REQUEST_TIMEOUT_MS = 10000; // 10 seconds for axios requests
 const EPISODE_FETCH_TIMEOUT_MS = 20000; // Longer timeout for episode fetches
 
 // --- Cache Storage Constants ---
-const BLOB_CACHE_KEY_PREFIX = 'mako-shows-cache-v1'; // Use as a PREFIX, not exact filename
-const MAX_BLOB_FILES_TO_KEEP = 2; // Number of recent cache blobs to keep
+const BLOB_CACHE_KEY = 'mako-shows-cache-v1.json'; // Use a single, consistent filename
+const MAX_BLOB_FILES_TO_KEEP = 1; // Keep only the most recent cache file
 
 // Headers for requests
 const HEADERS = {
@@ -80,11 +80,11 @@ const loadCache = async () => {
 
     if (blob) { // Production with Vercel Blob
         try {
-            console.log(`Attempting to load cache blob with prefix: ${BLOB_CACHE_KEY_PREFIX}`);
+            console.log(`Attempting to load cache blob with prefix: ${BLOB_CACHE_KEY}`);
             let mostRecent = null;
 
             try {
-                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY_PREFIX });
+                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY });
 
                 if (blobs && blobs.length > 0) {
                     const validBlobs = blobs.filter(b => b.uploadedAt);
@@ -104,10 +104,10 @@ const loadCache = async () => {
                             console.warn(`Found most recent cache blob ${mostRecent.pathname} but it has size 0. Ignoring.`);
                         }
                     } else {
-                        console.log(`No blobs found with prefix ${BLOB_CACHE_KEY_PREFIX} that have valid upload dates.`);
+                        console.log(`No blobs found with prefix ${BLOB_CACHE_KEY} that have valid upload dates.`);
                     }
                 } else {
-                    console.log(`No cache blobs found with prefix: ${BLOB_CACHE_KEY_PREFIX}`);
+                    console.log(`No cache blobs found with prefix: ${BLOB_CACHE_KEY}`);
                 }
             } catch (listOrGetError) {
                 if (listOrGetError.response) {
@@ -155,7 +155,6 @@ const saveCache = async (cache) => {
     }
 
     // Ensure structure and update timestamp *before* saving
-    // Work on a copy to avoid modifying the object passed in unexpectedly elsewhere
     const cacheToSave = ensureCacheStructure({ ...cache });
     cacheToSave.timestamp = Date.now();
 
@@ -168,57 +167,46 @@ const saveCache = async (cache) => {
 
     if (blob) { // Production with Vercel Blob
         try {
-             // Generate a unique pathname for this save operation using the prefix
-             const uniquePathname = `${BLOB_CACHE_KEY_PREFIX}-${cacheToSave.timestamp}-${Math.random().toString(36).substring(2, 10)}.json`;
-            console.log(`Attempting to save cache (${showCount} shows, ${seasonCount} seasons) to Blob: ${uniquePathname}`);
+            console.log(`Attempting to save cache (${showCount} shows, ${seasonCount} seasons) to Blob: ${BLOB_CACHE_KEY}`);
 
-            // Save the new cache file with the unique name
-            const putResult = await blob.put(uniquePathname, JSON.stringify(cacheToSave), {
-                access: 'public', // Make it publicly accessible for loading via URL
+            // Save the cache file with the consistent name
+            const putResult = await blob.put(BLOB_CACHE_KEY, JSON.stringify(cacheToSave), {
+                access: 'public',
                 contentType: 'application/json'
-                // addPathtoken: false, // Set if you need predictable URLs, but usually handled by unique path
             });
             console.log(`Cache saved successfully to Blob: ${putResult.pathname} (URL: ${putResult.url})`);
 
-            // --- Clean up old cache files (best effort) ---
+            // Clean up any old cache files (best effort)
             try {
-                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY_PREFIX });
-
-                // Filter out any blobs without valid upload dates before sorting/deleting
-                const validBlobs = blobs.filter(b => b.uploadedAt);
-
-                if (validBlobs && validBlobs.length > MAX_BLOB_FILES_TO_KEEP) {
-                    // Sort by upload time, descending (newest first)
-                    const sortedBlobs = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
-                    // Get the blobs to delete (all except the newest N)
-                    const blobsToDelete = sortedBlobs.slice(MAX_BLOB_FILES_TO_KEEP);
-
-                    console.log(`Found ${validBlobs.length} valid blobs, deleting ${blobsToDelete.length} older ones.`);
-
-                    // Delete old blobs using their URLs (required by blob.del)
-                    const deletePromises = blobsToDelete.map(oldBlob =>
-                        blob.del(oldBlob.url) // *** Use the blob's URL for deletion ***
-                           .then(() => console.log(`Deleted old cache file: ${oldBlob.pathname}`))
-                           .catch(delError => console.error(`Failed to delete old cache file ${oldBlob.pathname} (URL: ${oldBlob.url}):`, delError.message))
+                const { blobs } = await blob.list({ prefix: 'mako-shows-cache-v1' });
+                const validBlobs = blobs.filter(b => b.uploadedAt && b.pathname !== BLOB_CACHE_KEY);
+                
+                if (validBlobs.length > 0) {
+                    console.log(`Found ${validBlobs.length} old cache files to clean up`);
+                    
+                    // Delete old blobs
+                    const deletePromises = validBlobs.map(oldBlob =>
+                        blob.del(oldBlob.url)
+                            .then(() => console.log(`Deleted old cache file: ${oldBlob.pathname}`))
+                            .catch(delError => console.error(`Failed to delete old cache file ${oldBlob.pathname}:`, delError.message))
                     );
-                    await Promise.all(deletePromises); // Wait for deletions to attempt completion
+                    await Promise.all(deletePromises);
                 }
             } catch (cleanupError) {
                 console.error("Failed during cache cleanup:", cleanupError.message);
             }
         } catch (e) {
-            console.error(`Error saving cache to Blob storage (Path: ${uniquePathname}):`, e.message);
-            // Log Axios errors specifically if that's the cause
-            if (e.response) { console.error(`Axios Error Details: Status=${e.response.status}`); }
+            console.error(`Error saving cache to Blob storage:`, e.message);
+            if (e.response) {
+                console.error(`Axios Error Details: Status=${e.response.status}`);
+            }
         }
     } else { // Local Development
         try {
-            // Ensure directory exists (use LOCAL_CACHE_FILE constant for path)
             const cacheDir = path.dirname(LOCAL_CACHE_FILE);
             if (!fs.existsSync(cacheDir)) {
                 fs.mkdirSync(cacheDir, { recursive: true });
             }
-            // Write the local file
             fs.writeFileSync(LOCAL_CACHE_FILE, JSON.stringify(cacheToSave, null, 2), 'utf8');
             console.log(`Cache saved locally (${showCount} shows, ${seasonCount} seasons) to ${LOCAL_CACHE_FILE}`);
         } catch (e) {
