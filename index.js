@@ -813,7 +813,23 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
         console.log(`Stream handler: Got video URL: ${videoUrl}`);
 
-        return { streams: [{ url: videoUrl, title: 'Play' }] };
+        const streams = [{
+            url: videoUrl,
+            title: 'Play',
+            type: 'hls', // Specify HLS stream type
+            behaviorHints: {
+                notWebReady: true, // Indicate this is not a web-ready stream
+                bingeGroup: 'mako-vod', // Group episodes for binge watching
+                videoSize: 1920, // Indicate HD quality
+                subtitleStreams: [], // No subtitles available
+                audioChannels: 'stereo'
+            }
+        }];
+
+        console.log(`Stream: Responding with stream for ${episodeGuid}`);
+        res.setHeader('Cache-Control', 'no-store, max-age=0'); // Do not cache stream URLs
+        res.setHeader('Content-Type', 'application/json');
+        res.status(200).json({ streams });
     } catch (err) {
         console.error(`Stream handler error for ID ${id}:`, err);
         return { streams: [] };
@@ -1219,7 +1235,18 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         }
         console.log(`Stream handler: Got video URL: ${videoUrl}`);
 
-        const streams = [{ url: videoUrl, title: 'Play' }];
+        const streams = [{
+            url: videoUrl,
+            title: 'Play',
+            type: 'hls', // Specify HLS stream type
+            behaviorHints: {
+                notWebReady: true, // Indicate this is not a web-ready stream
+                bingeGroup: 'mako-vod', // Group episodes for binge watching
+                videoSize: 1920, // Indicate HD quality
+                subtitleStreams: [], // No subtitles available
+                audioChannels: 'stereo'
+            }
+        }];
 
         console.log(`Stream: Responding with stream for ${episodeGuid}`);
         res.setHeader('Cache-Control', 'no-store, max-age=0'); // Do not cache stream URLs
