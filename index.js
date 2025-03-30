@@ -656,6 +656,8 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
         if(needsSave) saveCache(cache).catch(e => console.error("Async cache save failed:", e));
 
+        // --- Fetch Episodes ---
+        console.log(`Meta: Fetching episodes for ${showName} (${showUrl})`);
         const seasons = await extractContent(showUrl, 'seasons');
         let episodesToProcess = [];
 
@@ -663,43 +665,65 @@ builder.defineMetaHandler(async ({ type, id }) => {
             episodesToProcess = await extractContent(showUrl, 'episodes');
             if (episodesToProcess.length > 0) episodesToProcess.forEach((ep, i) => { ep.seasonNum = 1; ep.episodeNum = i + 1; });
         } else {
-            const seasonLimit = process.env.NODE_ENV === 'production' ? 5 : 20;
+            // Increased season limit and added progress tracking
+            const seasonLimit = process.env.NODE_ENV === 'production' ? 15 : 30; // Increased from 5/20
             const seasonsToFetch = seasons.slice(0, seasonLimit);
-            if (seasonsToFetch.length < seasons.length) console.warn(`Meta: Limiting season processing to first ${seasonLimit} seasons.`);
+            const totalSeasons = seasons.length;
+            console.log(`Meta: Processing ${seasonsToFetch.length} out of ${totalSeasons} seasons for ${showName}`);
+            
+            if (seasonsToFetch.length < seasons.length) {
+                console.warn(`Meta: Limiting season processing to first ${seasonLimit} seasons.`);
+            }
 
+            let processedSeasons = 0;
             for (const season of seasonsToFetch) {
+                processedSeasons++;
+                console.log(`Meta: Processing season ${processedSeasons}/${seasonsToFetch.length}: ${season.name || season.url}`);
                 const episodes = await extractContent(season.url, 'episodes');
                 const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
-                episodes.forEach((ep, i) => { ep.seasonNum = seasonNum; ep.episodeNum = i + 1; episodesToProcess.push(ep); });
+                episodes.forEach((ep, i) => { 
+                    ep.seasonNum = seasonNum; 
+                    ep.episodeNum = i + 1; 
+                    episodesToProcess.push(ep); 
+                });
+                console.log(`Meta: Added ${episodes.length} episodes from season ${seasonNum}`);
                 await sleep(50);
             }
+            console.log(`Meta: Completed processing ${processedSeasons} seasons, total episodes: ${episodesToProcess.length}`);
         }
 
+        // Sort and map episodes
         episodesToProcess.sort((a, b) => (a.seasonNum - b.seasonNum) || (a.episodeNum - b.episodeNum));
         const videos = episodesToProcess.map(ep => ({
             id: `${id}:ep:${ep.guid}`,
             title: ep.name || `Episode ${ep.episodeNum}`,
-            season: ep.seasonNum,
-            episode: ep.episodeNum,
+            season: ep.seasonNum, 
+            episode: ep.episodeNum, 
             released: null
         }));
 
-        return {
+        const metaResponse = {
             meta: {
-                id,
-                type: 'series',
+                id, 
+                type: 'series', 
                 name: showName,
-                poster: showPoster,
-                posterShape: 'poster',
+                poster: showPoster, 
+                posterShape: 'poster', 
                 background: showBackground,
                 logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
-                description: 'מאקו VOD',
+                description: 'מאקו VOD', 
                 videos
             }
         };
+
+        console.log(`Meta: Responding with ${videos.length} videos for ${showName}`);
+        res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=600');
+        res.setHeader('Content-Type', 'application/json');
+        res.status(200).json(metaResponse);
+
     } catch (err) {
-        console.error(`Meta handler error for ID ${id}:`, err);
-        return { meta: null };
+        console.error(`Meta handler top-level error for ID ${req.params.id}:`, err);
+        res.status(500).json({ meta: null, error: 'Failed to process meta request' });
     }
 });
 
@@ -899,7 +923,6 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 
 // Meta endpoint
 app.get('/meta/:type/:id.json', async (req, res) => {
-     // ** Add Top Level Try/Catch **
      try {
         const { type, id } = req.params;
         console.log('Processing meta request:', { type, id });
@@ -920,41 +943,36 @@ app.get('/meta/:type/:id.json', async (req, res) => {
         let showName = cachedShowData?.name;
         let showPoster = cachedShowData?.poster;
         let showBackground = cachedShowData?.background;
-        let needsSave = false; // Flag to save cache only if needed
+        let needsSave = false;
 
-        // Fetch details ONLY if not in cache or cache is stale
         const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
         if (!cachedShowData || !isCacheFresh) {
              console.log(`Meta: Cache miss or stale for ${showUrl}, fetching details...`);
-             const showDetails = await extractShowName(showUrl); // This function now returns defaults on error
-             // Use fetched details only if they are valid, otherwise keep cached/placeholders
+             const showDetails = await extractShowName(showUrl);
              showName = showDetails?.name && showDetails.name !== 'Unknown Show' && showDetails.name !== 'Error Loading' ? showDetails.name : (showName || 'Unknown Show');
              showPoster = showDetails?.poster || showPoster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
              showBackground = showDetails?.background || showBackground || showPoster;
 
-             // Update cache only if we got valid details
              if(showDetails && showDetails.name && showDetails.name !== 'Unknown Show' && showDetails.name !== 'Error Loading') {
                  if (!cache.shows) cache.shows = {};
                  if (!cache.shows[showUrl]) cache.shows[showUrl] = {};
-                 cache.shows[showUrl] = { // Store all fetched details
+                 cache.shows[showUrl] = {
                      name: showName,
                      poster: showPoster,
                      background: showBackground,
                      lastUpdated: Date.now()
                  };
-                 needsSave = true; // Mark cache for saving
+                 needsSave = true;
              } else {
                  console.warn(`Meta: Failed to fetch valid details for ${showUrl}, using placeholders/stale data.`);
-                 showName = showName || 'Failed to Load'; // Fallback name
+                 showName = showName || 'Failed to Load';
              }
         } else {
-            // console.log(`Meta: Using fresh cached details for ${showUrl}`);
-             // Ensure defaults even from cache
              showName = showName || 'Loading...';
              showPoster = showPoster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
              showBackground = showBackground || showPoster;
         }
-        // Save cache if updated, but don't wait for it
+
         if(needsSave) saveCache(cache).catch(e => console.error("Async cache save failed:", e));
 
         // --- Fetch Episodes ---
@@ -966,18 +984,31 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             episodesToProcess = await extractContent(showUrl, 'episodes');
             if (episodesToProcess.length > 0) episodesToProcess.forEach((ep, i) => { ep.seasonNum = 1; ep.episodeNum = i + 1; });
         } else {
-            // Limit seasons fetched in serverless meta to prevent timeout
-            const seasonLimit = process.env.NODE_ENV === 'production' ? 5 : 20;
+            // Increased season limit and added progress tracking
+            const seasonLimit = process.env.NODE_ENV === 'production' ? 15 : 30; // Increased from 5/20
             const seasonsToFetch = seasons.slice(0, seasonLimit);
-             if (seasonsToFetch.length < seasons.length) console.warn(`Meta: Limiting season processing to first ${seasonLimit} seasons.`);
+            const totalSeasons = seasons.length;
+            console.log(`Meta: Processing ${seasonsToFetch.length} out of ${totalSeasons} seasons for ${showName}`);
+            
+            if (seasonsToFetch.length < seasons.length) {
+                console.warn(`Meta: Limiting season processing to first ${seasonLimit} seasons.`);
+            }
 
-             for (const season of seasonsToFetch) {
-                 // console.log(`Meta: Fetching episodes for season ${season.name || season.url}`);
-                 const episodes = await extractContent(season.url, 'episodes');
-                 const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
-                 episodes.forEach((ep, i) => { ep.seasonNum = seasonNum; ep.episodeNum = i + 1; episodesToProcess.push(ep); });
-                 await sleep(50); // Shorter delay in meta handler
-             }
+            let processedSeasons = 0;
+            for (const season of seasonsToFetch) {
+                processedSeasons++;
+                console.log(`Meta: Processing season ${processedSeasons}/${seasonsToFetch.length}: ${season.name || season.url}`);
+                const episodes = await extractContent(season.url, 'episodes');
+                const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
+                episodes.forEach((ep, i) => { 
+                    ep.seasonNum = seasonNum; 
+                    ep.episodeNum = i + 1; 
+                    episodesToProcess.push(ep); 
+                });
+                console.log(`Meta: Added ${episodes.length} episodes from season ${seasonNum}`);
+                await sleep(50);
+            }
+            console.log(`Meta: Completed processing ${processedSeasons} seasons, total episodes: ${episodesToProcess.length}`);
         }
 
         // Sort and map episodes
@@ -985,25 +1016,32 @@ app.get('/meta/:type/:id.json', async (req, res) => {
         const videos = episodesToProcess.map(ep => ({
             id: `${id}:ep:${ep.guid}`,
             title: ep.name || `Episode ${ep.episodeNum}`,
-            season: ep.seasonNum, episode: ep.episodeNum, released: null
+            season: ep.seasonNum, 
+            episode: ep.episodeNum, 
+            released: null
         }));
         // --- End Meta Logic ---
 
         const metaResponse = {
             meta: {
-                id, type: 'series', name: showName,
-                poster: showPoster, posterShape: 'poster', background: showBackground,
+                id, 
+                type: 'series', 
+                name: showName,
+                poster: showPoster, 
+                posterShape: 'poster', 
+                background: showBackground,
                 logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
-                description: 'מאקו VOD', videos
+                description: 'מאקו VOD', 
+                videos
             }
         };
 
         console.log(`Meta: Responding with ${videos.length} videos for ${showName}`);
-        res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=600'); // Cache meta for 1 hour
+        res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=600');
         res.setHeader('Content-Type', 'application/json');
         res.status(200).json(metaResponse);
 
-     } catch (err) { // ** Catch unexpected errors **
+     } catch (err) {
          console.error(`Meta handler top-level error for ID ${req.params.id}:`, err);
          res.status(500).json({ meta: null, error: 'Failed to process meta request' });
      }
@@ -1012,7 +1050,6 @@ app.get('/meta/:type/:id.json', async (req, res) => {
 
 // Define stream endpoint
 app.get('/stream/:type/:id.json', async (req, res) => {
-     // ** Add Top Level Try/Catch **
      try {
         const { type, id } = req.params;
         console.log('Processing stream request:', { type, id });
@@ -1076,7 +1113,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         res.setHeader('Content-Type', 'application/json');
         res.status(200).json({ streams });
 
-     } catch (err) { // ** Catch unexpected errors **
+     } catch (err) {
          console.error(`Stream handler top-level error for ID ${req.params.id}:`, err);
          res.status(500).json({ streams: [], error: 'Failed to process stream request' });
      }
