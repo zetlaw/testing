@@ -413,11 +413,15 @@ const extractContent = async (url, contentType) => {
         if (contentType === 'shows') {
             // Find all show links in the order they appear in the HTML
             const showLinks = [];
+            const seenUrls = new Set();
+
+            // Try each selector and combine results
             for (const selector of config.selectors) {
                 $(selector).each((_, elem) => {
                     const $elem = $(elem);
                     const href = $elem.attr('href');
-                    if (href && !showLinks.some(link => link.url === href)) {
+                    if (href && !seenUrls.has(href)) {
+                        seenUrls.add(href);
                         showLinks.push({
                             element: $elem,
                             url: href
@@ -425,6 +429,8 @@ const extractContent = async (url, contentType) => {
                     }
                 });
             }
+
+            console.log(`Found ${showLinks.length} unique show links from all selectors`);
 
             // Process each show in the original order
             for (const { element, url } of showLinks) {
