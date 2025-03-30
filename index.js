@@ -980,12 +980,14 @@ const updateShowMetadata = async (shows) => {
             const metadata = await processShowMetadata(show.url);
             if (metadata) {
                 metadataCache.metadata[show.url] = metadata;
+                console.log(`Updated metadata for ${show.url}: ${metadata.name}`);
             }
             await sleep(100); // Small delay between requests
         });
         
         await Promise.all(batchPromises);
         await saveCache(metadataCache, 'metadata');
+        console.log(`Saved metadata cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
         await sleep(1000); // Delay between batches
     }
     
@@ -999,17 +1001,6 @@ const backgroundRefresh = async () => {
         // Get fresh show list
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
         console.log(`Found ${shows.length} shows to process`);
-        
-        // Update main cache with show list
-        const mainCache = await loadCache('main');
-        mainCache.shows = {};
-        shows.forEach(show => {
-            mainCache.shows[show.url] = {
-                url: show.url,
-                lastUpdated: Date.now()
-            };
-        });
-        await saveCache(mainCache, 'main');
         
         // Update show metadata
         await updateShowMetadata(shows);
