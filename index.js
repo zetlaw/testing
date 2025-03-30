@@ -752,37 +752,71 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
 
 
-// Start server (modified for Vercel)
+// Get the addon interface
 const addonInterface = builder.getInterface();
 
-// Create the handler function
-const handler = async (req, res) => {
-    try {
-        // Handle CORS preflight requests
-        if (req.method === 'OPTIONS') {
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-            res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-            res.status(200).end();
-            return;
-        }
+// Create a proper serverless handler for Vercel
+const express = require('express');
+const cors = require('cors');
 
-        // Set CORS headers for all responses
-        res.setHeader('Access-Control-Allow-Origin', '*');
+// Create Express app for serverless
+const app = express();
+app.use(cors());
 
-        // Handle the request using the addon interface
-        const response = await addonInterface(req.url, req.headers);
-        
-        // Send the response
-        res.json(response);
-    } catch (error) {
-        console.error('Error handling request:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
-    }
-};
+// Define manifest endpoint
+app.get('/:path(manifest.json)?', (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.send(addonInterface.manifest);
+});
 
-// Export the handler function for Vercel
-module.exports = handler;
+// Define catalog endpoint
+app.get('/catalog/:type/:id/:extra?.json', (req, res) => {
+    const { type, id } = req.params;
+    const extra = req.params.extra ? JSON.parse(decodeURIComponent(req.params.extra)) : {};
+    
+    builder.definedHandlers.catalog({ type, id, extra })
+        .then(resp => {
+            res.setHeader('Content-Type', 'application/json');
+            res.send(resp);
+        })
+        .catch(err => {
+            console.error('Catalog error:', err);
+            res.status(500).send({ error: 'Error processing catalog request' });
+        });
+});
+
+// Define meta endpoint
+app.get('/meta/:type/:id.json', (req, res) => {
+    const { type, id } = req.params;
+    
+    builder.definedHandlers.meta({ type, id })
+        .then(resp => {
+            res.setHeader('Content-Type', 'application/json');
+            res.send(resp);
+        })
+        .catch(err => {
+            console.error('Meta error:', err);
+            res.status(500).send({ error: 'Error processing meta request' });
+        });
+});
+
+// Define stream endpoint
+app.get('/stream/:type/:id.json', (req, res) => {
+    const { type, id } = req.params;
+    
+    builder.definedHandlers.stream({ type, id })
+        .then(resp => {
+            res.setHeader('Content-Type', 'application/json');
+            res.send(resp);
+        })
+        .catch(err => {
+            console.error('Stream error:', err);
+            res.status(500).send({ error: 'Error processing stream request' });
+        });
+});
+
+// Create the serverless handler
+module.exports = app;
 
 // Only start the server if we're not in a serverless environment
 if (process.env.NODE_ENV !== 'production') {
