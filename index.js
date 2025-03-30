@@ -851,13 +851,8 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             catch (e) { console.warn("Failed to parse search extra:", req.params.extra); }
         }
 
-        const interface = builder.getInterface();
-        const catalog = interface.catalogs.find(cat => cat.type === type && cat.id === id);
-        if (!catalog) {
-            return res.status(404).json({ metas: [], error: 'Catalog not found.' });
-        }
-
-        const result = await catalog.handler({ type, id, extra });
+        // Use the catalog handler directly
+        const result = await builder.catalogHandler({ type, id, extra });
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300');
@@ -871,13 +866,8 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 app.get('/meta/:type/:id.json', async (req, res) => {
     try {
         const { type, id } = req.params;
-        const interface = builder.getInterface();
-        const meta = interface.meta.find(m => m.type === type);
-        if (!meta) {
-            return res.status(404).json({ meta: null, error: 'Meta not found.' });
-        }
-
-        const result = await meta.handler({ type, id });
+        // Use the meta handler directly
+        const result = await builder.metaHandler({ type, id });
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=1800');
@@ -891,13 +881,8 @@ app.get('/meta/:type/:id.json', async (req, res) => {
 app.get('/stream/:type/:id.json', async (req, res) => {
     try {
         const { type, id } = req.params;
-        const interface = builder.getInterface();
-        const stream = interface.stream.find(s => s.type === type);
-        if (!stream) {
-            return res.status(404).json({ streams: [], error: 'Stream not found.' });
-        }
-
-        const result = await stream.handler({ type, id });
+        // Use the stream handler directly
+        const result = await builder.streamHandler({ type, id });
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'no-store, max-age=0');
