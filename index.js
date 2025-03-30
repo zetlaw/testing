@@ -763,56 +763,38 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+// Helper function to parse URL for addonInterface
+const parseUrl = (url) => {
+    const urlObj = new URL('http://example.com' + url);
+    return {
+        pathname: urlObj.pathname,
+        searchParams: Object.fromEntries(urlObj.searchParams)
+    };
+};
+
 // Define manifest endpoint
 app.get('/:path(manifest.json)?', (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.send(addonInterface.manifest);
 });
 
-// Define catalog endpoint
-app.get('/catalog/:type/:id/:extra?.json', (req, res) => {
-    const { type, id } = req.params;
-    const extra = req.params.extra ? JSON.parse(decodeURIComponent(req.params.extra)) : {};
-    
-    builder.definedHandlers.catalog({ type, id, extra })
-        .then(resp => {
-            res.setHeader('Content-Type', 'application/json');
-            res.send(resp);
-        })
-        .catch(err => {
-            console.error('Catalog error:', err);
-            res.status(500).send({ error: 'Error processing catalog request' });
-        });
-});
-
-// Define meta endpoint
-app.get('/meta/:type/:id.json', (req, res) => {
-    const { type, id } = req.params;
-    
-    builder.definedHandlers.meta({ type, id })
-        .then(resp => {
-            res.setHeader('Content-Type', 'application/json');
-            res.send(resp);
-        })
-        .catch(err => {
-            console.error('Meta error:', err);
-            res.status(500).send({ error: 'Error processing meta request' });
-        });
-});
-
-// Define stream endpoint
-app.get('/stream/:type/:id.json', (req, res) => {
-    const { type, id } = req.params;
-    
-    builder.definedHandlers.stream({ type, id })
-        .then(resp => {
-            res.setHeader('Content-Type', 'application/json');
-            res.send(resp);
-        })
-        .catch(err => {
-            console.error('Stream error:', err);
-            res.status(500).send({ error: 'Error processing stream request' });
-        });
+// Define all other endpoints to be handled by addonInterface
+app.get('*', async (req, res) => {
+    try {
+        console.log('Processing request for:', req.url);
+        
+        // Use the addonInterface directly
+        const result = await addonInterface(req.url, req.headers);
+        
+        // Set appropriate headers
+        res.setHeader('Content-Type', 'application/json');
+        
+        // Send the response
+        res.send(result);
+    } catch (err) {
+        console.error('Error processing request:', err);
+        res.status(500).send({ error: 'Error processing request', message: err.message });
+    }
 });
 
 // Create the serverless handler
