@@ -59,7 +59,6 @@ const loadCache = async () => {
     const now = Date.now();
     // Return recent memory cache immediately to avoid multiple fetches within a short time
     if (memoryCache && (now - memoryCacheTimestamp < 60 * 1000)) { // Cache memory for 1 min
-        // console.log("Using recent memory cache.");
         return memoryCache;
     }
 
@@ -68,49 +67,59 @@ const loadCache = async () => {
             console.log(`Attempting to load cache blob: ${BLOB_CACHE_KEY}`);
             // Use head to check existence and metadata first
             const headResult = await blob.head(BLOB_CACHE_KEY).catch(err => {
-                if (err.message.includes('404')) return null; // Handle not found specifically
-                console.error("Blob head request failed:", err); // Log other head errors
-                throw err; // Rethrow other errors to be caught below
+                if (err.message.includes('404')) {
+                    console.log("Cache blob not found, initializing new cache");
+                    return null;
+                }
+                console.error("Blob head request failed:", err);
+                throw err;
             });
 
             if (headResult && headResult.size > 0) {
                 console.log(`Found cache blob: ${headResult.pathname}, Size: ${headResult.size}, URL: ${headResult.url}`);
                 // Fetch the actual cache data
-                const response = await axios.get(headResult.url, { timeout: 5000 }); // Short timeout for cache fetch
+                const response = await axios.get(headResult.url, { timeout: 5000 });
                 // Validate fetched data
                 if (typeof response.data !== 'object' || response.data === null) {
-                     console.warn("Fetched cache data is not a valid object, using empty cache.");
-                     memoryCache = { timestamp: now, shows: {} };
+                    console.warn("Fetched cache data is not a valid object, initializing new cache");
+                    memoryCache = { timestamp: now, shows: {} };
                 } else {
-                     memoryCache = response.data;
-                     console.log(`Loaded cache from Blob with ${Object.keys(memoryCache.shows || {}).length} items.`);
+                    memoryCache = response.data;
+                    console.log(`Loaded cache from Blob with ${Object.keys(memoryCache.shows || {}).length} items`);
                 }
-                memoryCacheTimestamp = now; // Update timestamp
-                return memoryCache;
             } else {
-                console.log("Cache blob not found or empty. Initializing empty cache.");
+                console.log("Initializing new cache");
                 memoryCache = { timestamp: now, shows: {} };
-                memoryCacheTimestamp = now;
-                return memoryCache;
+                // Save the initial cache
+                try {
+                    await blob.put(BLOB_CACHE_KEY, JSON.stringify(memoryCache), {
+                        access: 'public',
+                        contentType: 'application/json'
+                    });
+                    console.log("Initialized and saved new cache to Blob storage");
+                } catch (saveError) {
+                    console.error("Failed to save initial cache:", saveError);
+                }
             }
+            memoryCacheTimestamp = now;
+            return memoryCache;
         } catch (e) {
             console.error("Error loading cache from Blob storage:", e.message);
             // Fallback to empty cache on any error
-            memoryCache = { timestamp: Date.now(), shows: {} };
+            memoryCache = { timestamp: now, shows: {} };
             memoryCacheTimestamp = now;
             return memoryCache;
         }
     } else { // Local development or Blob failed to init
-        // console.log("Using local file system cache (or empty if none).");
         try {
             if (fs.existsSync(CACHE_FILE)) {
                 const fileData = fs.readFileSync(CACHE_FILE, 'utf8');
                 const data = JSON.parse(fileData);
-                 if (typeof data === 'object' && data !== null) {
-                     memoryCache = data;
-                     memoryCacheTimestamp = now;
-                     return memoryCache;
-                 }
+                if (typeof data === 'object' && data !== null) {
+                    memoryCache = data;
+                    memoryCacheTimestamp = now;
+                    return memoryCache;
+                }
             }
         } catch (e) {
             console.error("Error loading cache from file:", e.message);
