@@ -339,6 +339,26 @@ async function main() {
         const showList = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
         console.log(`Found ${showList.length} shows.`);
         
+        // Check if we already have metadata for the same number of shows
+        if (fs.existsSync(PRECACHED_METADATA_FILE)) {
+            try {
+                const existingMetadata = JSON.parse(fs.readFileSync(PRECACHED_METADATA_FILE, 'utf8'));
+                const existingShowCount = Object.keys(existingMetadata).length;
+                
+                if (existingShowCount === showList.length) {
+                    console.log(`Existing metadata contains ${existingShowCount} shows, which matches the fetched show count (${showList.length}).`);
+                    console.log('No update needed. Exiting...');
+                    return; // Exit early without updating
+                } else {
+                    console.log(`Show count mismatch: ${existingShowCount} in metadata vs ${showList.length} fetched. Proceeding with update...`);
+                }
+            } catch (readError) {
+                console.error(`Error reading existing metadata: ${readError.message}. Will regenerate.`);
+            }
+        } else {
+            console.log('No existing metadata file found. Will generate from scratch.');
+        }
+        
         // Metadata cache - the complete precached data
         const metadata = {};
         let completedShows = 0;
