@@ -1346,15 +1346,16 @@ app.get('/proxy/:token', async (req, res) => {
             'Accept-Language': 'en-US,en;q=0.9,he;q=0.8'
         };
         
-        // Add special handling for Cloudfront
-        if (originalUrl.includes('cloudfront.net')) {
-            console.log('CloudFront URL detected, adding specific headers');
-            customHeaders['Host'] = new URL(originalUrl).host;
+        // Add special handling for Cloudfront and Akamai
+        if (originalUrl.includes('cloudfront.net') || originalUrl.includes('akamaized.net')) {
+            console.log('CDN URL detected, adding specific headers');
+            const urlObj = new URL(originalUrl);
+            customHeaders['Host'] = urlObj.host;
         }
         
         // Forward the request to the original URL
         const response = await axios({
-            method: 'get',
+            method: req.method, // Use the same method as the incoming request
             url: originalUrl,
             responseType: 'arraybuffer',
             timeout: 30000,
@@ -1375,6 +1376,11 @@ app.get('/proxy/:token', async (req, res) => {
             if (['content-type', 'content-length', 'etag', 'last-modified', 'cache-control'].includes(key.toLowerCase())) {
                 res.setHeader(key, value);
             }
+        }
+        
+        // If it's a HEAD request, just return the headers
+        if (req.method === 'HEAD') {
+            return res.end();
         }
         
         // Ensure proper content type for HLS
@@ -1411,7 +1417,7 @@ app.get('/proxy/:token', async (req, res) => {
                             const absoluteUrl = new URL(line, baseUrl).href;
                             
                             // If it's another m3u8 file or ts segment, proxy it too
-                            if (line.includes('.m3u8') || (originalUrl.includes('cloudfront.net') && line.includes('.ts'))) {
+                            if (line.includes('.m3u8') || line.includes('.ts')) {
                                 const proxyToken = Buffer.from(absoluteUrl).toString('base64');
                                 return `${protocol}://${host}/proxy/${proxyToken}`;
                             }
@@ -1420,7 +1426,7 @@ app.get('/proxy/:token', async (req, res) => {
                         }
                         
                         // If it's already an absolute URL that is a playlist or ts segment, proxy it
-                        if (line.includes('.m3u8') || (originalUrl.includes('cloudfront.net') && line.includes('.ts'))) {
+                        if (line.includes('.m3u8') || line.includes('.ts')) {
                             const proxyToken = Buffer.from(line).toString('base64');
                             return `${protocol}://${host}/proxy/${proxyToken}`;
                         }
@@ -1451,6 +1457,12 @@ app.get('/proxy/:token', async (req, res) => {
         }
         res.send('Error proxying video stream');
     }
+});
+
+// Add HEAD method handler that delegates to the GET handler
+app.head('/proxy/:token', async (req, res) => {
+    // This will be handled by the GET method since we check the req.method
+    app.handle(req, res);
 });
 
 app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
