@@ -869,6 +869,62 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
 });
 
+// Define the meta handler
+builder.defineMetaHandler(async ({ type, id }) => {
+    if (type !== 'series' || !id.startsWith('mako:')) {
+        throw new Error('Invalid meta ID format');
+    }
+
+    let showUrl;
+    try {
+        showUrl = decodeURIComponent(id.replace('mako:', ''));
+        if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
+    } catch (e) {
+        console.error('Invalid show URL derived from meta ID:', id);
+        throw new Error('Invalid show URL in ID');
+    }
+
+    try {
+        // Load METADATA cache (show details & season episodes)
+        const metadataCache = await loadCache('metadata');
+
+        // 1. Get/Update Show Metadata
+        const { details: showDetails } = await getOrUpdateShowMetadata(showUrl, metadataCache);
+
+        // 2. Get/Update Episodes (uses/updates metadataCache.seasons)
+        const { episodes } = await getShowEpisodes(showUrl, metadataCache);
+
+        // 3. Save metadata cache if modified
+        await saveCache(metadataCache, 'metadata');
+
+        // 4. Format Stremio Meta Response
+        const videos = episodes.map(ep => ({
+            id: `${id}:ep:${ep.guid}`,
+            title: ep.name || `Episode ${ep.episodeNum}`,
+            season: ep.seasonNum,
+            episode: ep.episodeNum,
+            released: null, // Mako doesn't easily provide release dates
+        }));
+
+        return {
+            meta: {
+                id,
+                type: 'series',
+                name: showDetails.name,
+                poster: showDetails.poster,
+                posterShape: 'poster',
+                background: showDetails.background,
+                logo: DEFAULT_LOGO,
+                description: showDetails.description,
+                videos
+            }
+        };
+    } catch (err) {
+        console.error('Meta handler error:', err);
+        throw err;
+    }
+});
+
 // --- Express App Setup ---
 const app = express();
 app.use(cors());
@@ -924,72 +980,21 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 
 // Meta endpoint - Using Express Route
 app.get('/meta/:type/:id.json', async (req, res) => {
-    const { type, id } = req.params;
-    // console.log('Processing meta request via Express:', { type, id }); // Reduce noise
-
-    if (type !== 'series' || !id.startsWith('mako:')) {
-        return res.status(404).json({ meta: null, error: 'Invalid meta ID format' });
-    }
-
-    let showUrl;
     try {
-        showUrl = decodeURIComponent(id.replace('mako:', ''));
-        if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
-    } catch (e) {
-        console.error('Invalid show URL derived from meta ID:', id);
-        return res.status(400).json({ meta: null, error: 'Invalid show URL in ID' });
-    }
+        const { type, id } = req.params;
+        const result = await builder.getInterface().meta.find(m => 
+            m.type === type
+        )?.handler({ type, id });
 
-    let metadataCacheNeedsSave = false; // Track only metadata cache changes
-
-    try {
-        // Load METADATA cache (show details & season episodes)
-        const metadataCache = await loadCache('metadata');
-
-        // 1. Get/Update Show Metadata
-        const { details: showDetails, needsSave: detailsNeedSave } = await getOrUpdateShowMetadata(showUrl, metadataCache);
-        if (detailsNeedSave) metadataCacheNeedsSave = true;
-
-        // 2. Get/Update Episodes (uses/updates metadataCache.seasons)
-        const { episodes, needsSave: episodesNeedSave } = await getShowEpisodes(showUrl, metadataCache);
-        if (episodesNeedSave) metadataCacheNeedsSave = true;
-
-        // 3. Save metadata cache if modified (await before responding)
-        if (metadataCacheNeedsSave) {
-            console.log("Meta: Saving updated metadata cache...");
-            await saveCache(metadataCache, 'metadata');
+        if (!result) {
+            return res.status(404).json({ meta: null, error: 'Meta not found.' });
         }
 
-        // 4. Format Stremio Meta Response
-        const videos = episodes.map(ep => ({
-            id: `${id}:ep:${ep.guid}`,
-            title: ep.name || `Episode ${ep.episodeNum}`,
-            season: ep.seasonNum,
-            episode: ep.episodeNum,
-            released: null, // Mako doesn't easily provide release dates
-            // thumbnail: ep.thumbnail || showDetails.poster // Example using thumbnail if extracted
-        }));
-
-        const metaResponse = {
-            meta: {
-                id, type: 'series',
-                name: showDetails.name,
-                poster: showDetails.poster,
-                posterShape: 'poster',
-                background: showDetails.background,
-                logo: DEFAULT_LOGO,
-                description: showDetails.description, // Use fetched description
-                videos
-            }
-        };
-
-        console.log(`Meta: Responding with ${videos.length} videos for ${showDetails.name}`);
         res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=1800'); // Cache meta for 1 hour
-        res.status(200).json(metaResponse);
-
+        res.setHeader('Cache-Control', 'public, s-maxage=3600, stale-while-revalidate=1800');
+        res.status(200).json(result);
     } catch (err) {
-        console.error(`Meta handler error for ID ${id} (URL: ${showUrl}):`, err);
+        console.error('Meta endpoint error:', err);
         res.status(500).json({ meta: null, error: 'Failed to process meta request' });
     }
 });
