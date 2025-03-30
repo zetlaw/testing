@@ -297,40 +297,66 @@ const extractShowName = async (url) => {
 const extractContent = async (url, contentType) => {
     try {
         await sleep(DELAY_BETWEEN_REQUESTS_MS);
-        // console.log(`Workspaceing ${contentType} from ${url}`);
-        const response = await axios.get(url, { headers: HEADERS, timeout: REQUEST_TIMEOUT_MS });
+        console.log(`Extracting ${contentType} from ${url}`);
+        
+        // Increase timeout for initial show extraction
+        const timeout = contentType === 'shows' ? REQUEST_TIMEOUT_MS * 2 : REQUEST_TIMEOUT_MS;
+        const response = await axios.get(url, { 
+            headers: HEADERS, 
+            timeout: timeout,
+            maxRedirects: 5
+        });
+        
         const $ = cheerio.load(response.data);
 
         const configs = {
-             shows: {
+            shows: {
                 selectors: [
-                    // Try specific common structures first
                     '.vod_item_wrap article a[href^="/mako-vod-"]',
                     '.vod_item article a[href^="/mako-vod-"]',
                     'li.grid-item a[href^="/mako-vod-"]',
-                    'section[class*="vod"] a[href^="/mako-vod-"]', // Broader section
-                     // General link selector - potentially noisy
+                    'section[class*="vod"] a[href^="/mako-vod-"]',
                     'a[href^="/mako-vod-"]:not([href*="purchase"]):not([href*="index"])',
-                 ],
+                ],
                 fields: {
                     url: { attribute: 'href' },
-                    // Try multiple selectors for name, prioritize specific ones
                     name: [
-                        { selector: '.title strong' }, { selector: 'h3.title' }, { selector: 'h2.title' },
-                        { selector: '.vod-title' }, { selector: '.caption' },
-                        { selector: 'img', attribute: 'alt' }, // Alt text fallback
-                        { text: true } // Link text last resort
+                        { selector: '.title strong' },
+                        { selector: 'h3.title' },
+                        { selector: 'h2.title' },
+                        { selector: '.vod-title' },
+                        { selector: '.caption' },
+                        { selector: 'img', attribute: 'alt' },
+                        { text: true }
                     ],
                     poster: { selector: 'img', attribute: 'src' }
                 },
                 base: BASE_URL,
-                // Filter function specific to shows
-                filter: (item) => item.url && item.name && item.name !== 'Unknown Show' &&
-                                  !item.url.includes('/purchase') &&
-                                  !item.url.includes('/index') &&
-                                  !item.name.toLowerCase().includes('live') && // Exclude "LIVE" links
-                                  !item.name.toLowerCase().includes('יחצ') && // Exclude "PR" links
-                                  !item.name.toLowerCase().includes('מאקו') // Exclude generic Mako links
+                filter: (item) => {
+                    if (!item.url || !item.name) return false;
+                    
+                    // Clean up the name
+                    item.name = item.name
+                        .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+                        .replace(/[-–—]/g, ' ') // Replace various dashes with space
+                        .replace(/[^\u0590-\u05FF\s]/g, '') // Keep only Hebrew characters and spaces
+                        .trim();
+                    
+                    // Skip if name is too short or contains unwanted terms
+                    if (item.name.length < 2) return false;
+                    if (item.name.toLowerCase().includes('live')) return false;
+                    if (item.name.toLowerCase().includes('יחצ')) return false;
+                    if (item.name.toLowerCase().includes('מאקו')) return false;
+                    if (item.name.toLowerCase().includes('פוסטר')) return false;
+                    if (item.name.toLowerCase().includes('סט')) return false;
+                    if (item.name.toLowerCase().includes('hd')) return false;
+                    if (item.name.toLowerCase().includes('wow')) return false;
+                    if (item.name.toLowerCase().includes('ז\'אנר')) return false;
+                    if (item.name.toLowerCase().includes('כרטיס')) return false;
+                    if (item.name.toLowerCase().includes('מובייל')) return false;
+                    
+                    return true;
+                }
             },
             seasons: {
                 selectors: ['div#seasonDropdown ul ul li a'],
@@ -358,39 +384,36 @@ const extractContent = async (url, contentType) => {
         for (const selector of config.selectors) {
             try {
                 elements = $(selector).toArray();
-                 if (elements.length > 0) {
-                    // console.log(`Found ${elements.length} elements for ${contentType} with selector: ${selector}`);
-                    break; // Use the first selector that finds elements
-                 }
+                if (elements.length > 0) {
+                    console.log(`Found ${elements.length} elements for ${contentType} with selector: ${selector}`);
+                    break;
+                }
             } catch(selectorError) {
-                 console.warn(`Selector "${selector}" failed: ${selectorError.message}`);
+                console.warn(`Selector "${selector}" failed: ${selectorError.message}`);
             }
         }
         if (elements.length === 0) console.warn(`No elements found for ${contentType} at ${url}`);
 
-
         for (const elem of elements) {
             const item = {};
             for (const [field, fieldConfig] of Object.entries(config.fields)) {
-                // Special handling for array of name selectors
                 if (field === 'name' && Array.isArray(fieldConfig)) {
                     for (const nameConf of fieldConfig) {
-                         try {
+                        try {
                             const target = nameConf.selector ? $(elem).find(nameConf.selector) : $(elem);
                             if (target.length) {
                                 let value = nameConf.attribute ? target.first().attr(nameConf.attribute) : (nameConf.text ? $(elem).text() : target.first().text());
                                 if (value) {
-                                    item[field] = value.replace(/\s+/g, ' ').trim(); // Clean whitespace
-                                    break; // Found name
+                                    item[field] = value.replace(/\s+/g, ' ').trim();
+                                    break;
                                 }
                             }
-                         } catch(nameSelectorError){ continue; } // Ignore errors for specific name selectors
+                        } catch(nameSelectorError){ continue; }
                     }
-                    continue; // Move to next field after handling name array
+                    continue;
                 }
 
-                // Regular field processing
-                 try {
+                try {
                     const selector = fieldConfig.selector;
                     const attr = fieldConfig.attribute;
                     const regex = fieldConfig.regex;
@@ -401,28 +424,25 @@ const extractContent = async (url, contentType) => {
                         if (value && regex && field === 'guid') {
                             const match = value.match(regex);
                             if (match) value = match[1];
-                            else value = null; // Clear value if regex must match but doesn't
+                            else value = null;
                         }
-                         if (value && field === 'url') {
-                             value = new URL(value, config.base).href.split('?')[0].split('#')[0]; // Clean URL
-                         }
+                        if (value && field === 'url') {
+                            value = new URL(value, config.base).href.split('?')[0].split('#')[0];
+                        }
                         if (value !== undefined && value !== null && value !== '') item[field] = value;
                     }
-                 } catch(fieldError) { continue; } // Ignore errors for specific fields
+                } catch(fieldError) { continue; }
             }
 
-            // Check filter and uniqueness
             if (config.filter(item)) {
                 const key = item.guid || item.url;
                 if (key && !seen.has(key)) {
-                    // Apply defaults and processing specific to type
                     if (contentType === 'shows') {
                         item.name = item.name || 'Unknown Show';
                         item.poster = processImageUrl(item.poster) || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
                         item.background = item.poster;
                     } else if (contentType === 'episodes' && !item.name) {
-                         // Try getting name from link text if strong.title fails
-                         item.name = $(elem).text().replace(/\s+/g, ' ').trim() || null;
+                        item.name = $(elem).text().replace(/\s+/g, ' ').trim() || null;
                     }
 
                     items.push(item);
@@ -433,41 +453,29 @@ const extractContent = async (url, contentType) => {
 
         if (contentType === 'shows') {
             console.log(`Extracted ${items.length} valid initial show items for ${url}`);
-            // Load cache and apply details, but don't start background processing here
             const cache = await loadCache();
             const cacheIsFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
-             for (const show of items) {
-                 if (cache.shows && cache.shows[show.url]) {
-                     const cachedData = cache.shows[show.url];
-                     show.name = cachedData.name || show.name;
-                     show.poster = cachedData.poster || show.poster;
-                     show.background = cachedData.background || show.poster;
-                 }
-                 // Ensure required fields have defaults even if not in cache
-                 show.name = show.name || 'Loading...';
-                 show.poster = show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
-                 show.background = show.background || show.poster;
-             }
-             if(cacheIsFresh) console.log("Applied cached details where available.");
-             else console.log("Cache is stale or empty, applying defaults.");
-
-        } else if (contentType === 'episodes') {
-             // Final GUID extraction pass
-            for (const ep of items) {
-                if (!ep.guid && ep.url) {
-                    const match = ep.url.match(/[?&](guid|videoGuid)=([\w-]+)/i);
-                    if (match) ep.guid = match[2];
+            
+            for (const show of items) {
+                if (cache.shows && cache.shows[show.url]) {
+                    const cachedData = cache.shows[show.url];
+                    show.name = cachedData.name || show.name;
+                    show.poster = cachedData.poster || show.poster;
+                    show.background = cachedData.background || show.poster;
                 }
+                show.name = show.name || 'Loading...';
+                show.poster = show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
+                show.background = show.background || show.poster;
             }
-            const validEpisodes = items.filter(ep => ep.guid);
-            console.log(`Extracted ${validEpisodes.length} episodes with GUIDs for ${url}`);
-            return validEpisodes;
+            
+            if(cacheIsFresh) console.log("Applied cached details where available.");
+            else console.log("Cache is stale or empty, applying defaults.");
         }
 
-        return items; // Return shows or seasons
+        return items;
     } catch (e) {
         console.error(`Error in extractContent (${contentType}, ${url}):`, e.message);
-        return []; // Return empty array on error
+        return [];
     }
 };
 
