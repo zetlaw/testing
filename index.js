@@ -83,16 +83,30 @@ const loadCache = async () => {
             console.log(`Attempting to load cache blob: ${BLOB_CACHE_KEY}`);
             
             try {
-                // Try to get the exact file first
-                const response = await axios.get(`${blob.url}/${BLOB_CACHE_KEY}`, { 
-                    timeout: REQUEST_TIMEOUT_MS + 5000 
-                });
+                // List blobs to get the URL
+                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY });
                 
-                if (response.data && typeof response.data === 'object') {
-                    loadedData = response.data;
-                    console.log(`Successfully loaded cache from Blob: ${BLOB_CACHE_KEY}`);
+                if (blobs && blobs.length > 0) {
+                    // Get the most recent blob
+                    const mostRecent = blobs
+                        .filter(b => b.uploadedAt)
+                        .sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))[0];
+                    
+                    if (mostRecent && mostRecent.url) {
+                        console.log(`Found cache blob: ${mostRecent.pathname}`);
+                        const response = await axios.get(mostRecent.url, { 
+                            timeout: REQUEST_TIMEOUT_MS + 5000 
+                        });
+                        
+                        if (response.data && typeof response.data === 'object') {
+                            loadedData = response.data;
+                            console.log(`Successfully loaded cache from Blob: ${mostRecent.pathname}`);
+                        } else {
+                            console.warn(`Found cache blob ${mostRecent.pathname} but content was invalid type: ${typeof response.data}`);
+                        }
+                    }
                 } else {
-                    console.warn(`Found cache blob ${BLOB_CACHE_KEY} but content was invalid type: ${typeof response.data}`);
+                    console.log(`No cache blob found: ${BLOB_CACHE_KEY}`);
                 }
             } catch (getError) {
                 if (getError.response && getError.response.status === 404) {
