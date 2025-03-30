@@ -31,8 +31,37 @@ const MAX_BLOB_FILES_TO_KEEP = 2;
 
 // --- Precached data paths ---
 // Keep precached data in the read-only filesystem since it's pregenerated
-const PRECACHED_DIR = path.join(__dirname, 'precached');
-const PRECACHED_METADATA_FILE = path.join(PRECACHED_DIR, 'metadata.json');
+let PRECACHED_DIR = path.join(__dirname, 'precached');
+let PRECACHED_METADATA_FILE = path.join(PRECACHED_DIR, 'metadata.json');
+
+// In serverless environments, try alternate paths if the file doesn't exist
+if (IS_SERVERLESS) {
+    // Log the environment for debugging
+    console.log(`Running in serverless environment. __dirname=${__dirname}`);
+    console.log(`Default precached path: ${PRECACHED_METADATA_FILE}`);
+    
+    // Try fallback paths for serverless environments
+    const fallbackPaths = [
+        path.join(process.cwd(), 'precached/metadata.json'),
+        '/tmp/precached/metadata.json',
+        path.join(__dirname, '../precached/metadata.json'),
+        path.join(__dirname, '../../precached/metadata.json')
+    ];
+    
+    if (!fs.existsSync(PRECACHED_METADATA_FILE)) {
+        console.log(`Primary precached metadata file not found, trying fallbacks...`);
+        for (const fallbackPath of fallbackPaths) {
+            if (fs.existsSync(fallbackPath)) {
+                console.log(`Found precached metadata at fallback path: ${fallbackPath}`);
+                PRECACHED_METADATA_FILE = fallbackPath;
+                PRECACHED_DIR = path.dirname(fallbackPath);
+                break;
+            } else {
+                console.log(`Fallback path not found: ${fallbackPath}`);
+            }
+        }
+    }
+}
 
 // --- Headers ---
 const HEADERS = {
@@ -76,8 +105,51 @@ try {
         // Initialize the metadata cache with the precached data
         globalMetadataCache = precachedData;
         console.log(`Loaded ${Object.keys(globalMetadataCache).length} pre-cached metadata entries`);
+        
+        // If in serverless, copy precached data to /tmp for future invocations
+        if (IS_SERVERLESS) {
+            try {
+                const tmpDir = '/tmp/precached';
+                if (!fs.existsSync(tmpDir)) {
+                    fs.mkdirSync(tmpDir, { recursive: true });
+                }
+                const tmpFile = path.join(tmpDir, 'metadata.json');
+                fs.writeFileSync(tmpFile, JSON.stringify(precachedData));
+                console.log(`Copied precached metadata to ${tmpFile} for future invocations`);
+            } catch (copyErr) {
+                console.error(`Failed to copy precached data to /tmp: ${copyErr.message}`);
+            }
+        }
     } else {
         console.log(`Pre-cached metadata file not found at ${PRECACHED_METADATA_FILE}`);
+        
+        // Try a direct HTTP fetch of the metadata if in serverless
+        if (IS_SERVERLESS) {
+            try {
+                console.log('Attempting to fetch precached metadata via HTTP');
+                const deploymentUrl = process.env.VERCEL_URL || '';
+                if (deploymentUrl) {
+                    const metadataUrl = `https://${deploymentUrl}/precached/metadata.json`;
+                    console.log(`Fetching from: ${metadataUrl}`);
+                    const response = await axios.get(metadataUrl, { timeout: 10000 });
+                    if (response.data && typeof response.data === 'object') {
+                        globalMetadataCache = response.data;
+                        console.log(`Successfully fetched ${Object.keys(globalMetadataCache).length} metadata entries via HTTP`);
+                        
+                        // Save to tmp for future invocations
+                        const tmpDir = '/tmp/precached';
+                        if (!fs.existsSync(tmpDir)) {
+                            fs.mkdirSync(tmpDir, { recursive: true });
+                        }
+                        fs.writeFileSync(path.join(tmpDir, 'metadata.json'), JSON.stringify(globalMetadataCache));
+                    }
+                } else {
+                    console.log('No deployment URL found in environment variables');
+                }
+            } catch (httpErr) {
+                console.error(`HTTP fetch of metadata failed: ${httpErr.message}`);
+            }
+        }
     }
     
     // Load any additional locally cached metadata if it exists
@@ -975,32 +1047,40 @@ builder.defineMetaHandler(async ({ type, id }) => {
         
         // Get seasons and episodes
         const seasons = await extractContent(showUrl, 'seasons');
-        let allSeasons = seasons && seasons.length > 0 ? 
-            [{ name: "Season 1", url: showUrl, seasonNum: 1 }, ...seasons.map((s, i) => ({ ...s, seasonNum: i + 2 }))] :
-            [{ name: "Season 1", url: showUrl, seasonNum: 1 }];
+        let allSeasons = [];
         
         // Process just the first two seasons to avoid timeouts
-        const seasonsToProcess = allSeasons.slice(0, 2);
+        const seasonsToProcess = seasons && seasons.length > 0 ? seasons.slice(0, 2) : [{ name: "Season 1", url: showUrl }];
         const allEpisodes = [];
         
         for (const season of seasonsToProcess) {
             const episodes = await extractContent(season.url, 'episodes');
             if (episodes && episodes.length > 0) {
                 const seasonEpisodes = episodes.map((ep, idx) => ({
-                    ...ep, seasonNum: season.seasonNum, episodeNum: idx + 1
+                    ...ep,
+                    seasonNum: season.seasonNum,
+                    episodeNum: idx + 1
                 }));
+                
                 allEpisodes.push(...seasonEpisodes);
+                console.log(`Added ${seasonEpisodes.length} episodes from season ${season.seasonNum}`);
+            } else {
+                console.log(`No episodes found for season ${season.seasonNum}`);
             }
+            
+            // Add a small delay between season processing
             await sleep(200);
         }
         
-        // Sort episodes
+        // Sort episodes by season and episode number
         allEpisodes.sort((a, b) => {
             if (a.seasonNum !== b.seasonNum) return a.seasonNum - b.seasonNum;
             return a.episodeNum - b.episodeNum;
         });
         
-        // Create videos array for Stremio
+        console.log(`Total episodes found: ${allEpisodes.length}`);
+        
+        // Organize episodes into videos for Stremio
         const videos = allEpisodes.map(ep => ({
             id: `${id}:ep:${ep.guid}`,
             title: ep.name || `S${ep.seasonNum}E${ep.episodeNum}`,
@@ -1450,7 +1530,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 
         console.log(`Looking for episode with GUID: ${episodeGuid} from show: ${showUrl}`);
         
-        // Find target episode URL by searching through seasons
+        // Find target episode
         let targetEpisode = null;
         
         // First get all seasons

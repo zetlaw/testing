@@ -3,10 +3,21 @@
   "builds": [
     {
       "src": "index.js",
-      "use": "@vercel/node"
+      "use": "@vercel/node",
+      "config": {
+        "buildCommand": "node prepare-vercel.js"
+      }
+    },
+    {
+      "src": "precached/**",
+      "use": "@vercel/static"
     }
   ],
   "routes": [
+    {
+      "src": "/precached/(.*)",
+      "dest": "/precached/$1"
+    },
     {
       "src": "/(.*)",
       "dest": "/index.js"
