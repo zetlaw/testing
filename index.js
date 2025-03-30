@@ -319,17 +319,18 @@ const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => 
 const extractContent = async (url, contentType) => {
     try {
         await sleep(DELAY_BETWEEN_REQUESTS);
+        console.log(`Fetching ${contentType} from ${url}`);
         const response = await axios.get(url, { headers: HEADERS, timeout: REQUEST_TIMEOUT });
         const $ = cheerio.load(response.data);
 
         const configs = {
-             shows: {
+            shows: {
                 selectors: [
-                    'li > a[href^="/mako-vod-"]',
-                    'li a[href^="/mako-vod-"]',
-                    '.vod_item a[href^="/mako-vod-"]',
-                    '.vod_item_wrap a[href^="/mako-vod-"]'
-                 ],
+                    'a[href^="/mako-vod-"]:not([href*="purchase"]):not([href*="index"])',
+                    '.vod_item a[href^="/mako-vod-"]:not([href*="purchase"]):not([href*="index"])',
+                    '.vod_item_wrap a[href^="/mako-vod-"]:not([href*="purchase"]):not([href*="index"])',
+                    'li > a[href^="/mako-vod-"]:not([href*="purchase"]):not([href*="index"])'
+                ],
                 fields: {
                     url: { attribute: 'href' },
                     tempName: { selector: 'img', attribute: 'alt' },
@@ -360,10 +361,15 @@ const extractContent = async (url, contentType) => {
         let elements = [];
         for (const selector of config.selectors) {
             elements = $(selector).toArray();
-            if (elements.length) break;
+            if (elements.length) {
+                console.log(`Found ${elements.length} elements with selector: ${selector}`);
+                break;
+            }
         }
 
-        // console.log(`Found ${elements.length} ${contentType} elements`);
+        if (contentType === 'shows') {
+            console.log(`Processing ${elements.length} potential show elements`);
+        }
 
         for (const elem of elements) {
             const item = {};
@@ -390,23 +396,36 @@ const extractContent = async (url, contentType) => {
             }
 
             // Ensure essential fields exist before adding
-             if ((contentType === 'shows' && item.url) ||
+            if ((contentType === 'shows' && item.url && !item.url.includes('purchase') && !item.url.includes('index')) ||
                 (contentType === 'seasons' && item.url && item.name) ||
                 (contentType === 'episodes' && item.url))
-             {
+            {
                 const key = item.guid || item.url;
                 if (key && !seen.has(key)) {
                     if (contentType === 'shows') {
-                        item.name = item.tempName || 'Unknown Show';
+                        // Try to get a better name from various sources
+                        item.name = item.tempName || 
+                                  $(elem).find('.title').text().trim() ||
+                                  $(elem).find('h2, h3').text().trim() ||
+                                  'Unknown Show';
                         delete item.tempName;
                         item.poster = processImageUrl(item.poster);
-                         if (item.poster && item.poster.includes('_next/static')) {
+                        if (item.poster && item.poster.includes('_next/static')) {
                             item.poster = 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
-                         }
+                        }
+                        console.log(`Found show: ${item.name} at ${item.url}`);
                     }
                     items.push(item);
                     seen.add(key);
                 }
+            }
+        }
+
+        if (contentType === 'shows') {
+            console.log(`Found ${items.length} valid shows`);
+            // Log first few shows for debugging
+            if (items.length > 0) {
+                console.log('First 5 shows:', items.slice(0, 5).map(s => ({ name: s.name, url: s.url })));
             }
         }
 
