@@ -758,13 +758,16 @@ const addonInterface = builder.getInterface();
 // Create Express app for serverless
 const express = require('express');
 const cors = require('cors');
-const url = require('url');
 
 const app = express();
 app.use(cors());
 
 // Define manifest endpoint
-app.get('/:path(manifest.json)?', (req, res) => {
+app.get('/', (req, res) => {
+    res.redirect('/manifest.json');
+});
+
+app.get('/manifest.json', (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.send(addonInterface.manifest);
 });
@@ -784,11 +787,16 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             }
         }
         
-        // Use the catalog handler we defined earlier
-        const result = await builder.defineCatalogHandler({ type, id, extra });
+        // Call the handler we defined with defineCatalogHandler but directly
+        const handlerResult = await addonInterface.get({ 
+            resource: 'catalog', 
+            type, 
+            id, 
+            extra 
+        });
         
         res.setHeader('Content-Type', 'application/json');
-        res.json(result);
+        res.send(handlerResult);
     } catch (err) {
         console.error('Catalog error:', err);
         res.status(500).json({ error: 'Error processing catalog request', message: err.message });
@@ -801,11 +809,15 @@ app.get('/meta/:type/:id.json', async (req, res) => {
         console.log('Processing meta request:', req.params);
         const { type, id } = req.params;
         
-        // Use the meta handler we defined earlier
-        const result = await builder.defineMetaHandler({ type, id });
+        // Call the handler we defined with defineMetaHandler but directly
+        const handlerResult = await addonInterface.get({ 
+            resource: 'meta', 
+            type, 
+            id 
+        });
         
         res.setHeader('Content-Type', 'application/json');
-        res.json(result);
+        res.send(handlerResult);
     } catch (err) {
         console.error('Meta error:', err);
         res.status(500).json({ error: 'Error processing meta request', message: err.message });
@@ -818,11 +830,15 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         console.log('Processing stream request:', req.params);
         const { type, id } = req.params;
         
-        // Use the stream handler we defined earlier
-        const result = await builder.defineStreamHandler({ type, id });
+        // Call the handler we defined with defineStreamHandler but directly
+        const handlerResult = await addonInterface.get({ 
+            resource: 'stream', 
+            type, 
+            id 
+        });
         
         res.setHeader('Content-Type', 'application/json');
-        res.json(result);
+        res.send(handlerResult);
     } catch (err) {
         console.error('Stream error:', err);
         res.status(500).json({ error: 'Error processing stream request', message: err.message });
