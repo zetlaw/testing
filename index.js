@@ -1070,7 +1070,9 @@ builder.defineMetaHandler(async ({ type, id }) => {
             released: null
         }));
 
-        const metaResponse = {
+        console.log(`Meta: Responding with ${videos.length} videos for ${showName}`);
+        
+        return {
             meta: {
                 id, 
                 type: 'series', 
@@ -1084,14 +1086,9 @@ builder.defineMetaHandler(async ({ type, id }) => {
             }
         };
 
-        console.log(`Meta: Responding with ${videos.length} videos for ${showName}`);
-        res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=600');
-        res.setHeader('Content-Type', 'application/json');
-        res.status(200).json(metaResponse);
-
     } catch (err) {
-        console.error(`Meta handler top-level error for ID ${req.params.id}:`, err);
-        res.status(500).json({ meta: null, error: 'Failed to process meta request' });
+        console.error(`Meta handler error for ID ${id}:`, err);
+        return { meta: null };
     }
 });
 
@@ -1146,23 +1143,23 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
         console.log(`Stream handler: Got video URL: ${videoUrl}`);
 
-        const streams = [{
-            url: videoUrl,
-            title: 'Play',
-            type: 'hls', // Specify HLS stream type
-            behaviorHints: {
-                notWebReady: true, // Indicate this is not a web-ready stream
-                bingeGroup: 'mako-vod', // Group episodes for binge watching
-                videoSize: 1920, // Indicate HD quality
-                subtitleStreams: [], // No subtitles available
-                audioChannels: 'stereo'
-            }
-        }];
-
         console.log(`Stream: Responding with stream for ${episodeGuid}`);
-        res.setHeader('Cache-Control', 'no-store, max-age=0'); // Do not cache stream URLs
-        res.setHeader('Content-Type', 'application/json');
-        res.status(200).json({ streams });
+        
+        return {
+            streams: [{
+                url: videoUrl,
+                title: 'Play',
+                type: 'hls', // Specify HLS stream type
+                behaviorHints: {
+                    notWebReady: true, // Indicate this is not a web-ready stream
+                    bingeGroup: 'mako-vod', // Group episodes for binge watching
+                    videoSize: 1920, // Indicate HD quality
+                    subtitleStreams: [], // No subtitles available
+                    audioChannels: 'stereo'
+                }
+            }]
+        };
+        
     } catch (err) {
         console.error(`Stream handler error for ID ${id}:`, err);
         return { streams: [] };
