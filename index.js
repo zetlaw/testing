@@ -1238,15 +1238,29 @@ builder.defineStreamHandler(async ({ type, id }) => {
             return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
         }
 
+        // Create a base64 token from the HLS URL
+        const proxyToken = Buffer.from(videoUrl).toString('base64');
+        // Get the base URL for the current request
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        // Create a proxied URL
+        const proxiedUrl = `${baseUrl}/proxy/${proxyToken}`;
+
+        console.log(`Original URL: ${videoUrl}`);
+        console.log(`Proxied URL: ${proxiedUrl}`);
+
         const result = {
             streams: [{
-                url: videoUrl,
+                url: proxiedUrl,
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
                 mimeType: 'application/x-mpegURL',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
-                    notWebReady: false
+                    notWebReady: false,
+                    // Set other helpful hints for players
+                    forceTranscode: false,
+                    proxyHeaders: false,
+                    playerType: 'Default'
                 }
             }]
         };
@@ -1284,6 +1298,56 @@ app.get('/manifest.json', (req, res) => {
 });
 
 app.get('/', (req, res) => res.redirect('/manifest.json'));
+
+// Video proxy route to bypass CORS
+app.get('/proxy/:token', async (req, res) => {
+    try {
+        const { token } = req.params;
+        if (!token) {
+            return res.status(400).send('Missing token parameter');
+        }
+        
+        // Decode the base64 token to get the original URL
+        let originalUrl;
+        try {
+            const buffer = Buffer.from(token, 'base64');
+            originalUrl = buffer.toString('utf8');
+        } catch (e) {
+            return res.status(400).send('Invalid token format');
+        }
+        
+        console.log(`Proxying request to: ${originalUrl}`);
+        
+        // Forward the request to the original URL
+        const response = await axios({
+            method: 'get',
+            url: originalUrl,
+            responseType: 'stream',
+            timeout: 30000,
+            headers: {
+                'User-Agent': USER_AGENT,
+                'Referer': 'https://www.mako.co.il/',
+                'Origin': 'https://www.mako.co.il'
+            }
+        });
+        
+        // Set CORS headers to allow all origins
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
+        
+        // Forward the content type
+        if (response.headers['content-type']) {
+            res.setHeader('Content-Type', response.headers['content-type']);
+        }
+        
+        // Send the video stream
+        response.data.pipe(res);
+    } catch (error) {
+        console.error('Proxy error:', error.message);
+        res.status(500).send('Error proxying video stream');
+    }
+});
 
 app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
     try {
@@ -1656,15 +1720,29 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
         }
 
+        // Create a base64 token from the HLS URL
+        const proxyToken = Buffer.from(videoUrl).toString('base64');
+        // Get the base URL for the current request
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        // Create a proxied URL
+        const proxiedUrl = `${baseUrl}/proxy/${proxyToken}`;
+
+        console.log(`Original URL: ${videoUrl}`);
+        console.log(`Proxied URL: ${proxiedUrl}`);
+
         const result = {
             streams: [{
-                url: videoUrl,
+                url: proxiedUrl,
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
                 mimeType: 'application/x-mpegURL',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
-                    notWebReady: false
+                    notWebReady: false,
+                    // Set other helpful hints for players
+                    forceTranscode: false,
+                    proxyHeaders: false,
+                    playerType: 'Default'
                 }
             }]
         };
