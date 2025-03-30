@@ -24,10 +24,14 @@ const HEADERS = {
     'Connection': 'keep-alive'
 };
 
-// Cache management (remains the same)
-// ... loadCache, saveCache ...
-
+// Cache management (modified for serverless)
 const loadCache = () => {
+    // In production/serverless, use empty cache
+    if (process.env.NODE_ENV === 'production') {
+        console.log("Running in production/serverless mode - using in-memory cache only");
+        return { timestamp: Date.now(), shows: {} };
+    }
+    
     try {
         if (fs.existsSync(CACHE_FILE)) {
             return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
@@ -40,6 +44,11 @@ const loadCache = () => {
 };
 
 const saveCache = (cache) => {
+    // Skip file operations in production/serverless
+    if (process.env.NODE_ENV === 'production') {
+        return;
+    }
+    
     try {
         const cacheDir = path.dirname(CACHE_FILE);
         if (!fs.existsSync(cacheDir)) {
@@ -128,17 +137,25 @@ const extractShowName = async (url) => {
     }
 };
 
-// Process show names (remains the same)
-// ... processShowNames ...
+// Process show names (modified for serverless)
 const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => {
     let updatesCount = 0;
     let processedCount = 0;
 
-    const showsToProcess = maxShows && maxShows < shows.length ? shows.slice(0, maxShows) : shows;
+    // In serverless, limit the shows to process
+    let showLimit = process.env.NODE_ENV === 'production' ? 10 : null;
+    // If caller specified a limit, use the lower of the two
+    if (maxShows !== null) {
+        showLimit = showLimit ? Math.min(showLimit, maxShows) : maxShows;
+    }
+    
+    const showsToProcess = showLimit && showLimit < shows.length ? shows.slice(0, showLimit) : shows;
     const total = showsToProcess.length;
     console.log(`Processing ${total} shows in background...`);
 
-    const BATCH_SIZE = 5;
+    // Use smaller batch size in serverless to avoid timeouts
+    const BATCH_SIZE = process.env.NODE_ENV === 'production' ? 2 : 5;
+    
     for (let i = 0; i < showsToProcess.length; i += BATCH_SIZE) {
         const batch = showsToProcess.slice(i, i + BATCH_SIZE);
         const batchPromises = batch.map(async (show) => {
@@ -153,7 +170,28 @@ const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => 
                     return;
                 }
 
-                const details = await extractShowName(url);
+                // Add timeout handling for serverless
+                let details;
+                try {
+                    // Use a shorter timeout in serverless
+                    const timeoutMs = process.env.NODE_ENV === 'production' ? 5000 : REQUEST_TIMEOUT;
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+                    
+                    details = await Promise.race([
+                        extractShowName(url),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error(`Timeout getting show details for ${url}`)), timeoutMs)
+                        )
+                    ]);
+                    
+                    clearTimeout(timeoutId);
+                } catch (timeoutErr) {
+                    console.error(`Timeout extracting show name from ${url}`);
+                    processedCount++;
+                    return;
+                }
+                
                 if (details) {
                     // console.log(`Found new show name: ${details.name}`);
                     show.name = details.name;
@@ -172,10 +210,15 @@ const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => 
 
             } catch (e) {
                 console.error(`Error processing show ${show?.name || 'unknown'}:`, e.message);
+                processedCount++;
             }
         });
 
-        await Promise.all(batchPromises);
+        try {
+            await Promise.all(batchPromises);
+        } catch (batchError) {
+            console.error("Error processing batch of shows:", batchError);
+        }
 
         if (processedCount % 20 === 0 || processedCount === total) {
              console.log(`Background progress: ${processedCount}/${total} shows processed (${(processedCount/total*100).toFixed(1)}%)`);
@@ -186,8 +229,11 @@ const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => 
             saveCache(cache);
             updatesCount = 0; // Reset after save
         }
-        await sleep(100); // Small delay between batches
+        
+        // Add longer delay between batches in serverless
+        await sleep(process.env.NODE_ENV === 'production' ? 300 : 100);
     }
+    
     // Final save if any pending updates
     if (updatesCount > 0) {
          cache.timestamp = Date.now();
@@ -195,8 +241,7 @@ const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => 
     }
 };
 
-// Content extraction (remains the same)
-// ... extractContent ...
+// Content extraction (modified for serverless)
 const extractContent = async (url, contentType) => {
     try {
         await sleep(DELAY_BETWEEN_REQUESTS);
@@ -329,9 +374,14 @@ const extractContent = async (url, contentType) => {
                  }
             }
 
-
             if (cachedCount) console.log(`Using ${cachedCount} show details from fresh cache`);
 
+            // In serverless, don't start background processing
+            if (process.env.NODE_ENV === 'production') {
+                console.log("Running in serverless - skipping background name processing");
+                return items;
+            }
+            
             const toFetch = items.filter(show => !(cacheIsFresh && cache.shows[show.url]));
             if (toFetch.length === 0 && cacheIsFresh) {
                 console.log("All show names already in fresh cache!");
