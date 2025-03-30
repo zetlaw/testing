@@ -1241,23 +1241,29 @@ builder.defineStreamHandler(async ({ type, id }) => {
         // Return the direct URL without proxying
         console.log(`Original video URL: ${videoUrl}`);
 
+        // Send the streams
         const result = {
-            streams: [{
-                url: videoUrl, // Direct URL to the HLS playlist
-                title: `Play: ${targetEpisode.name || 'Episode'}`,
-                type: 'hls',
-                mimeType: 'application/vnd.apple.mpegurl',
-                behaviorHints: {
-                    bingeGroup: `mako-${showUrl}`,
-                    notWebReady: false,
-                    // Tell Stremio to directly access the source
-                    headers: {
-                        'User-Agent': USER_AGENT,
-                        'Referer': 'https://www.mako.co.il/',
-                        'Origin': 'https://www.mako.co.il'
+            streams: [
+                {
+                    // Native HLS direct stream - for desktop/mobile players 
+                    url: videoUrl,
+                    title: `Play: ${targetEpisode.name || 'Episode'} (Direct)`,
+                    type: 'hls',
+                    mimeType: 'application/vnd.apple.mpegurl',
+                    behaviorHints: {
+                        bingeGroup: `mako-${showUrl}`,
+                        notWebReady: false,
+                        headers: {
+                            'User-Agent': USER_AGENT,
+                            'Referer': 'https://www.mako.co.il/',
+                            'Origin': 'https://www.mako.co.il'
+                        },
+                        cors: true, // Signal that CORS is likely needed
+                        forceTranscode: false,
+                        trustURLAuth: true // Trust the URL authentication parameters
                     }
                 }
-            }]
+            ]
         };
 
         res.setHeader('Content-Type', 'application/json');
@@ -1784,23 +1790,29 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         // Return the direct URL without proxying
         console.log(`Original video URL: ${videoUrl}`);
 
+        // Send the streams
         const result = {
-            streams: [{
-                url: videoUrl, // Direct URL to the HLS playlist
-                title: `Play: ${targetEpisode.name || 'Episode'}`,
-                type: 'hls',
-                mimeType: 'application/vnd.apple.mpegurl',
-                behaviorHints: {
-                    bingeGroup: `mako-${showUrl}`,
-                    notWebReady: false,
-                    // Tell Stremio to directly access the source
-                    headers: {
-                        'User-Agent': USER_AGENT,
-                        'Referer': 'https://www.mako.co.il/',
-                        'Origin': 'https://www.mako.co.il'
+            streams: [
+                {
+                    // Native HLS direct stream - for desktop/mobile players 
+                    url: videoUrl,
+                    title: `Play: ${targetEpisode.name || 'Episode'} (Direct)`,
+                    type: 'hls',
+                    mimeType: 'application/vnd.apple.mpegurl',
+                    behaviorHints: {
+                        bingeGroup: `mako-${showUrl}`,
+                        notWebReady: false,
+                        headers: {
+                            'User-Agent': USER_AGENT,
+                            'Referer': 'https://www.mako.co.il/',
+                            'Origin': 'https://www.mako.co.il'
+                        },
+                        cors: true, // Signal that CORS is likely needed
+                        forceTranscode: false,
+                        trustURLAuth: true // Trust the URL authentication parameters
                     }
                 }
-            }]
+            ]
         };
 
         res.setHeader('Content-Type', 'application/json');
