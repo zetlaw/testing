@@ -679,6 +679,231 @@ const builder = new addonBuilder({
     behaviorHints: { adult: false, configurationRequired: false }
 });
 
+// --- Background Refresh Constants ---
+const REFRESH_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+const BATCH_SIZE = 10; // Number of shows to process in each batch
+let refreshInterval = null;
+
+// --- Background Refresh Functions ---
+const processShowMetadata = async (url) => {
+    try {
+        console.log(`Fetching fresh details for ${url}`);
+        const response = await axios.get(`${BASE_URL}${url}`, {
+            timeout: REQUEST_TIMEOUT_MS * 2,
+            maxRedirects: 5
+        });
+
+        // Parse the HTML
+        const $ = cheerio.load(response.data);
+        
+        // Extract JSON-LD data for show name (more accurate)
+        let name = '';
+        const jsonLdScript = $('script[type="application/ld+json"]').html();
+        if (jsonLdScript) {
+            try {
+                const jsonData = JSON.parse(jsonLdScript);
+                
+                // Check if this is a TVSeason and get the series name
+                if (jsonData['@type'] === 'TVSeason' && jsonData.partOfTVSeries) {
+                    name = jsonData.partOfTVSeries.name;
+                    console.log(`Found TVSeason, using series name: ${name}`);
+                } else {
+                    // Regular TVSeries handling
+                    name = jsonData.name;
+                }
+                
+                console.log(`Extracted name from JSON-LD: ${name}`);
+                
+                // Add season info if available
+                if (jsonData.containsSeason && Array.isArray(jsonData.containsSeason) && jsonData.containsSeason.length > 1) {
+                    const seasonsCount = jsonData.containsSeason.length;
+                    name = `${name} (${seasonsCount} עונות)`;
+                }
+            } catch (jsonError) {
+                console.warn(`Error parsing JSON-LD for ${url}: ${jsonError.message}`);
+            }
+        }
+        
+        // Fallback to meta tags if JSON-LD extraction failed
+        if (!name) {
+            name = $('meta[property="og:title"]').attr('content') ||
+                   $('meta[name="title"]').attr('content') ||
+                   $('title').text();
+            
+            // Clean up the name
+            if (name) {
+                name = name.replace('מאקו', '').replace('VOD', '').trim();
+            }
+        }
+        
+        // Get background image
+        const background = $('meta[property="og:image"]').attr('content') || 
+                          $('.hero-image img').attr('src') || 
+                          $('.show-image img').attr('src');
+                          
+        // Get poster image
+        let poster = $('.vod-item img').attr('src') || 
+                     $('.show-poster img').attr('src') || 
+                     $('meta[property="og:image:secure_url"]').attr('content');
+                     
+        if (!poster && background) {
+            poster = background;
+        }
+        
+        // Only return metadata if we have the necessary fields
+        if (name && (poster || background)) {
+            return {
+                name,
+                poster,
+                background: background || poster,
+                lastUpdated: Date.now()
+            };
+        }
+        
+        console.warn(`Could not extract metadata for ${url}`);
+        return null;
+    } catch (error) {
+        console.error(`Error processing show metadata for ${url}:`, error.message);
+        return null;
+    }
+};
+
+const updateShowMetadata = async (shows) => {
+    console.log('Starting show metadata update...');
+    
+    if (!shows || !Array.isArray(shows) || shows.length === 0) {
+        console.warn('No shows to update metadata for');
+        return;
+    }
+    
+    try {
+        let metadataCache = await loadCache('metadata');
+        
+        // Safety check: ensure metadataCache exists
+        if (!metadataCache) {
+            console.log('Creating new metadata cache object');
+            metadataCache = { timestamp: Date.now(), metadata: {} };
+        }
+        
+        // Ensure metadata structure exists
+        if (!metadataCache.metadata) {
+            console.log('Initializing empty metadata object');
+            metadataCache.metadata = {};
+        }
+        
+        // Process shows in batches
+        for (let i = 0; i < shows.length; i += BATCH_SIZE) {
+            const batch = shows.slice(i, i + BATCH_SIZE);
+            console.log(`Processing metadata batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(shows.length/BATCH_SIZE)}`);
+            
+            const batchPromises = batch.map(async (show) => {
+                if (!show || !show.url) {
+                    console.log('Skipping show with missing URL');
+                    return;
+                }
+                
+                // Skip if we have fresh metadata
+                try {
+                    const existingMetadata = metadataCache.metadata[show.url];
+                    if (existingMetadata && (Date.now() - existingMetadata.lastUpdated < CACHE_TTL_MS)) {
+                        console.log(`Using cached metadata for ${show.url}`);
+                        return;
+                    }
+                } catch (err) {
+                    console.error(`Error checking existing metadata: ${err.message}`);
+                }
+                
+                try {
+                    const metadata = await processShowMetadata(show.url);
+                    if (metadata) {
+                        metadataCache.metadata[show.url] = metadata;
+                        console.log(`Updated metadata for ${show.url}: ${metadata.name}`);
+                    }
+                } catch (err) {
+                    console.error(`Error processing metadata for ${show.url}: ${err.message}`);
+                }
+                
+                await sleep(100); // Small delay between requests
+            });
+            
+            try {
+                await Promise.all(batchPromises);
+                await saveCache(metadataCache, 'metadata');
+                console.log(`Saved metadata cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
+            } catch (err) {
+                console.error(`Error processing batch: ${err.message}`);
+            }
+            
+            await sleep(1000); // Delay between batches
+        }
+        
+        console.log('Completed show metadata update');
+    } catch (err) {
+        console.error(`Error in updateShowMetadata: ${err.message}`);
+    }
+};
+
+const backgroundRefresh = async () => {
+    try {
+        console.log('Starting background refresh...');
+        
+        // Get fresh show list from index page
+        const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
+        console.log(`Found ${shows.length} shows to process`);
+        
+        // Load metadata cache
+        const metadataCache = await loadCache('metadata');
+        
+        // Ensure metadata structure exists
+        if (!metadataCache.metadata) {
+            console.log('Creating new metadata object in cache');
+            metadataCache.metadata = {};
+        }
+        
+        // Count shows needing metadata
+        let needsMetadataCount = 0;
+        for (const show of shows) {
+            if (!show.url) continue;
+            
+            // Check if we need to update metadata for this show
+            const existingMetadata = metadataCache.metadata[show.url];
+            if (!existingMetadata || (Date.now() - (existingMetadata.lastUpdated || 0) > CACHE_TTL_MS)) {
+                needsMetadataCount++;
+            }
+        }
+        
+        console.log(`Found ${needsMetadataCount} shows needing metadata updates out of ${shows.length} total shows`);
+        
+        // Update metadata for all shows
+        await updateShowMetadata(shows);
+        
+        // Save the updated timestamp
+        metadataCache.timestamp = Date.now();
+        await saveCache(metadataCache, 'metadata');
+        
+        console.log('Background refresh completed successfully');
+    } catch (err) {
+        console.error('Background refresh error:', err);
+    }
+};
+
+// Start background refresh immediately and set up interval
+const startBackgroundRefresh = () => {
+    if (refreshInterval) {
+        clearInterval(refreshInterval);
+    }
+    
+    console.log('Starting initial background refresh to populate metadata cache...');
+    // Run immediately on startup with high priority
+    setTimeout(() => {
+        backgroundRefresh().catch(err => console.error('Initial background refresh failed:', err));
+    }, 100);
+    
+    // Then set up interval for regular updates
+    refreshInterval = setInterval(backgroundRefresh, REFRESH_INTERVAL);
+    console.log(`Background refresh scheduled to run every ${REFRESH_INTERVAL/1000/60/60} hours`);
+};
+
 // Define handlers using the SDK
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     try {
@@ -960,610 +1185,20 @@ app.use((req, res, next) => {
     next();
 });
 
-// Manifest endpoint
-app.get('/manifest.json', (req, res) => {
-    try {
-        res.setHeader('Content-Type', 'application/json');
-        res.send(addonInterface.manifest);
-    } catch (err) {
-        console.error("Error generating manifest:", err);
-        res.status(500).json({ error: 'Failed to generate manifest' });
-    }
-});
+// Use the SDK's serveHTTP function to handle all addon routes automatically
+serveHTTP(addonInterface, { app });
+
 // Redirect root to manifest
 app.get('/', (req, res) => res.redirect('/manifest.json'));
-
-// --- Background Refresh Constants ---
-const REFRESH_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
-const BATCH_SIZE = 10; // Number of shows to process in each batch
-let refreshInterval = null;
-
-// --- Background Refresh Functions ---
-const processShowMetadata = async (url) => {
-    try {
-        console.log(`Fetching fresh details for ${url}`);
-        const response = await axios.get(`${BASE_URL}${url}`, {
-            timeout: REQUEST_TIMEOUT_MS * 2,
-            maxRedirects: 5
-        });
-
-        // Parse the HTML
-        const $ = cheerio.load(response.data);
-        
-        // Extract JSON-LD data for show name (more accurate)
-        let name = '';
-        const jsonLdScript = $('script[type="application/ld+json"]').html();
-        if (jsonLdScript) {
-            try {
-                const jsonData = JSON.parse(jsonLdScript);
-                
-                // Check if this is a TVSeason and get the series name
-                if (jsonData['@type'] === 'TVSeason' && jsonData.partOfTVSeries) {
-                    name = jsonData.partOfTVSeries.name;
-                    console.log(`Found TVSeason, using series name: ${name}`);
-                } else {
-                    // Regular TVSeries handling
-                    name = jsonData.name;
-                }
-                
-                console.log(`Extracted name from JSON-LD: ${name}`);
-                
-                // Add season info if available
-                if (jsonData.containsSeason && Array.isArray(jsonData.containsSeason) && jsonData.containsSeason.length > 1) {
-                    const seasonsCount = jsonData.containsSeason.length;
-                    name = `${name} (${seasonsCount} עונות)`;
-                }
-            } catch (jsonError) {
-                console.warn(`Error parsing JSON-LD for ${url}: ${jsonError.message}`);
-            }
-        }
-        
-        // Fallback to meta tags if JSON-LD extraction failed
-        if (!name) {
-            name = $('meta[property="og:title"]').attr('content') ||
-                   $('meta[name="title"]').attr('content') ||
-                   $('title').text();
-            
-            // Clean up the name
-            if (name) {
-                name = name.replace('מאקו', '').replace('VOD', '').trim();
-            }
-        }
-        
-        // Get background image
-        const background = $('meta[property="og:image"]').attr('content') || 
-                          $('.hero-image img').attr('src') || 
-                          $('.show-image img').attr('src');
-                          
-        // Get poster image
-        let poster = $('.vod-item img').attr('src') || 
-                     $('.show-poster img').attr('src') || 
-                     $('meta[property="og:image:secure_url"]').attr('content');
-                     
-        if (!poster && background) {
-            poster = background;
-        }
-        
-        // Only return metadata if we have the necessary fields
-        if (name && (poster || background)) {
-            return {
-                name,
-                poster,
-                background: background || poster,
-                lastUpdated: Date.now()
-            };
-        }
-        
-        console.warn(`Could not extract metadata for ${url}`);
-        return null;
-    } catch (error) {
-        console.error(`Error processing show metadata for ${url}:`, error.message);
-        return null;
-    }
-};
-
-const updateShowMetadata = async (shows) => {
-    console.log('Starting show metadata update...');
-    
-    if (!shows || !Array.isArray(shows) || shows.length === 0) {
-        console.warn('No shows to update metadata for');
-        return;
-    }
-    
-    try {
-        let metadataCache = await loadCache('metadata');
-        
-        // Safety check: ensure metadataCache exists
-        if (!metadataCache) {
-            console.log('Creating new metadata cache object');
-            metadataCache = { timestamp: Date.now(), metadata: {} };
-        }
-        
-        // Ensure metadata structure exists
-        if (!metadataCache.metadata) {
-            console.log('Initializing empty metadata object');
-            metadataCache.metadata = {};
-        }
-        
-        // Process shows in batches
-        for (let i = 0; i < shows.length; i += BATCH_SIZE) {
-            const batch = shows.slice(i, i + BATCH_SIZE);
-            console.log(`Processing metadata batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(shows.length/BATCH_SIZE)}`);
-            
-            const batchPromises = batch.map(async (show) => {
-                if (!show || !show.url) {
-                    console.log('Skipping show with missing URL');
-                    return;
-                }
-                
-                // Skip if we have fresh metadata
-                try {
-                    const existingMetadata = metadataCache.metadata[show.url];
-                    if (existingMetadata && (Date.now() - existingMetadata.lastUpdated < CACHE_TTL_MS)) {
-                        console.log(`Using cached metadata for ${show.url}`);
-                        return;
-                    }
-                } catch (err) {
-                    console.error(`Error checking existing metadata: ${err.message}`);
-                }
-                
-                try {
-                    const metadata = await processShowMetadata(show.url);
-                    if (metadata) {
-                        metadataCache.metadata[show.url] = metadata;
-                        console.log(`Updated metadata for ${show.url}: ${metadata.name}`);
-                    }
-                } catch (err) {
-                    console.error(`Error processing metadata for ${show.url}: ${err.message}`);
-                }
-                
-                await sleep(100); // Small delay between requests
-            });
-            
-            try {
-                await Promise.all(batchPromises);
-                await saveCache(metadataCache, 'metadata');
-                console.log(`Saved metadata cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
-            } catch (err) {
-                console.error(`Error processing batch: ${err.message}`);
-            }
-            
-            await sleep(1000); // Delay between batches
-        }
-        
-        console.log('Completed show metadata update');
-    } catch (err) {
-        console.error(`Error in updateShowMetadata: ${err.message}`);
-    }
-};
-
-const backgroundRefresh = async () => {
-    try {
-        console.log('Starting background refresh...');
-        
-        // Get fresh show list from index page
-        const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
-        console.log(`Found ${shows.length} shows to process`);
-        
-        // Load metadata cache
-        const metadataCache = await loadCache('metadata');
-        
-        // Ensure metadata structure exists
-        if (!metadataCache.metadata) {
-            console.log('Creating new metadata object in cache');
-            metadataCache.metadata = {};
-        }
-        
-        // Count shows needing metadata
-        let needsMetadataCount = 0;
-        for (const show of shows) {
-            if (!show.url) continue;
-            
-            // Check if we need to update metadata for this show
-            const existingMetadata = metadataCache.metadata[show.url];
-            if (!existingMetadata || (Date.now() - (existingMetadata.lastUpdated || 0) > CACHE_TTL_MS)) {
-                needsMetadataCount++;
-            }
-        }
-        
-        console.log(`Found ${needsMetadataCount} shows needing metadata updates out of ${shows.length} total shows`);
-        
-        // Update metadata for all shows
-        await updateShowMetadata(shows);
-        
-        // Save the updated timestamp
-        metadataCache.timestamp = Date.now();
-        await saveCache(metadataCache, 'metadata');
-        
-        console.log('Background refresh completed successfully');
-    } catch (err) {
-        console.error('Background refresh error:', err);
-    }
-};
-
-// Start background refresh immediately and set up interval
-const startBackgroundRefresh = () => {
-    if (refreshInterval) {
-        clearInterval(refreshInterval);
-    }
-    
-    console.log('Starting initial background refresh to populate metadata cache...');
-    // Run immediately on startup with high priority
-    setTimeout(() => {
-        backgroundRefresh().catch(err => console.error('Initial background refresh failed:', err));
-    }, 100);
-    
-    // Then set up interval for regular updates
-    refreshInterval = setInterval(backgroundRefresh, REFRESH_INTERVAL);
-    console.log(`Background refresh scheduled to run every ${REFRESH_INTERVAL/1000/60/60} hours`);
-};
-
-// Start background refresh when the app starts
-startBackgroundRefresh();
-
-// --- Modified Catalog Endpoint ---
-app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
-    try {
-        const { type, id } = req.params;
-        let extra = {};
-        if (req.params.extra && req.params.extra.includes('search=')) {
-            try { extra.search = decodeURIComponent(req.params.extra.split('search=')[1]); }
-            catch(e){ console.warn("Failed to parse search extra:", req.params.extra); }
-        }
-        console.log('Processing catalog request:', { type, id, extra });
-
-        if (type !== 'series' || id !== 'mako-vod-shows') {
-            console.log('Invalid catalog request, returning empty.');
-            return res.status(200).json({ metas: [] });
-        }
-
-        // Load metadata cache first
-        const metadataCache = await loadCache('metadata');
-        const isMetadataFresh = Date.now() - (metadataCache.timestamp || 0) < CACHE_TTL_MS;
-        console.log(`Metadata cache freshness: ${isMetadataFresh ? 'fresh' : 'stale'}`);
-
-        // Get initial shows list
-        const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
-        console.log(`Extracted ${shows.length} initial shows`);
-
-        // Filter based on search if needed
-        let filteredShows = shows;
-        if (extra?.search) {
-            const search = extra.search.toLowerCase();
-            filteredShows = shows.filter(show => {
-                // Check metadata name first if available
-                if (metadataCache.metadata && metadataCache.metadata[show.url]) {
-                    return metadataCache.metadata[show.url].name.toLowerCase().includes(search);
-                }
-                // Otherwise, use index page name as fallback
-                return show.name && show.name.toLowerCase().includes(search);
-            });
-            console.log(`Found ${filteredShows.length} shows matching search: ${search}`);
-        }
-
-        // Process shows using metadata cache only
-        const processedShows = filteredShows.filter(show => {
-            return metadataCache.metadata && metadataCache.metadata[show.url];
-        }).map(show => {
-            const metadata = metadataCache.metadata[show.url];
-            return {
-                ...show,
-                name: metadata.name,
-                poster: metadata.poster,
-                background: metadata.background
-            };
-        });
-
-        // Create meta objects
-        const metas = processedShows.map(show => ({
-            id: `mako:${encodeURIComponent(show.url)}`,
-            type: 'series',
-            name: show.name,
-            poster: show.poster,
-            posterShape: 'poster',
-            background: show.background,
-            logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
-            description: 'מאקו VOD',
-        }));
-
-        // Send response with all shows
-        console.log(`Catalog: Responding with ${metas.length} metas`);
-        res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600');
-        res.setHeader('Content-Type', 'application/json');
-        res.status(200).json({ metas });
-
-    } catch (err) {
-        console.error('Catalog handler error:', err);
-        res.status(500).json({ metas: [], error: 'Failed to process catalog request' });
-    }
-});
-
-// Meta endpoint
-app.get('/meta/:type/:id.json', async (req, res) => {
-     try {
-        const { type, id } = req.params;
-        console.log('Processing meta request:', { type, id });
-
-        if (type !== 'series' || !id.startsWith('mako:')) {
-            return res.status(404).json({ meta: null, err: 'Invalid meta ID format' });
-        }
-
-        const showUrl = decodeURIComponent(id.replace('mako:', ''));
-        if (!showUrl.startsWith(BASE_URL)) {
-             console.error('Invalid show URL derived from meta ID:', showUrl);
-             return res.status(400).json({ meta: null, err: 'Invalid show URL' });
-        }
-
-        // --- Meta Logic ---
-        const cache = await loadCache();
-        const cachedShowData = cache.shows ? cache.shows[showUrl] : null;
-        let showName = cachedShowData?.name;
-        let showPoster = cachedShowData?.poster;
-        let showBackground = cachedShowData?.background;
-        let needsSave = false;
-
-        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
-        if (!cachedShowData || !isCacheFresh) {
-             console.log(`Meta: Cache miss or stale for ${showUrl}, fetching details...`);
-             const showDetails = await extractShowName(showUrl);
-             showName = showDetails?.name && showDetails.name !== 'Unknown Show' && showDetails.name !== 'Error Loading' ? showDetails.name : (showName || 'Unknown Show');
-             showPoster = showDetails?.poster || showPoster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
-             showBackground = showDetails?.background || showBackground || showPoster;
-
-             if(showDetails && showDetails.name && showDetails.name !== 'Unknown Show' && showDetails.name !== 'Error Loading') {
-                 if (!cache.shows) cache.shows = {};
-                 if (!cache.shows[showUrl]) cache.shows[showUrl] = {};
-                 cache.shows[showUrl] = {
-                     name: showName,
-                     poster: showPoster,
-                     background: showBackground,
-                     lastUpdated: Date.now()
-                 };
-                 needsSave = true;
-             } else {
-                 console.warn(`Meta: Failed to fetch valid details for ${showUrl}, using placeholders/stale data.`);
-                 showName = showName || 'Failed to Load';
-             }
-        } else {
-             showName = showName || 'Loading...';
-             showPoster = showPoster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
-             showBackground = showBackground || showPoster;
-        }
-
-        if(needsSave) saveCache(cache).catch(e => console.error("Async cache save failed:", e));
-
-        // --- Fetch Episodes ---
-        console.log(`Meta: Fetching episodes for ${showName} (${showUrl})`);
-        const seasons = await extractContent(showUrl, 'seasons');
-        let episodesToProcess = [];
-
-        if (!seasons || seasons.length === 0) {
-            episodesToProcess = await extractContent(showUrl, 'episodes');
-            if (episodesToProcess.length > 0) episodesToProcess.forEach((ep, i) => { ep.seasonNum = 1; ep.episodeNum = i + 1; });
-        } else {
-            console.log(`Meta: Processing all ${seasons.length} seasons for ${showName}`);
-            
-            // Process seasons in parallel with rate limiting
-            const batchSize = 5; // Increased from 3 to 5 seasons at a time
-            const seasonBatches = [];
-            
-            for (let i = 0; i < seasons.length; i += batchSize) {
-                const batch = seasons.slice(i, i + batchSize);
-                const batchPromises = batch.map(async (season) => {
-                    const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
-                    console.log(`Meta: Processing season ${seasonNum}: ${season.name || season.url}`);
-                    
-                    // Check cache for season episodes
-                    const cacheKey = `season:${season.url}`;
-                    let episodes = null;
-                    
-                    if (cache.seasons && cache.seasons[cacheKey] && isCacheFresh) {
-                        console.log(`Meta: Using cached episodes for season ${seasonNum}`);
-                        episodes = cache.seasons[cacheKey];
-                    } else {
-                        // Increased timeout for episode fetching
-                        const response = await axios.get(season.url, { 
-                            headers: HEADERS, 
-                            timeout: REQUEST_TIMEOUT_MS * 2 // Double the timeout
-                        });
-                        episodes = await extractContent(season.url, 'episodes');
-                        // Cache the episodes
-                        if (!cache.seasons) cache.seasons = {};
-                        cache.seasons[cacheKey] = episodes;
-                    }
-                    
-                    return episodes;
-                });
-                
-                const batchResults = await Promise.all(batchPromises);
-                episodesToProcess.push(...batchResults.flat());
-                await sleep(50); // Reduced delay between batches since we're processing more at once
-            }
-            
-            console.log(`Meta: Completed processing all ${seasons.length} seasons, total episodes: ${episodesToProcess.length}`);
-            
-            // Save updated cache if needed
-            if (needsSave) {
-                await saveCache(cache);
-            }
-        }
-
-        // Sort and map episodes
-        episodesToProcess.sort((a, b) => (a.seasonNum - b.seasonNum) || (a.episodeNum - b.episodeNum));
-        const videos = episodesToProcess.map(ep => ({
-            id: `${id}:ep:${ep.guid}`,
-            title: ep.name || `Episode ${ep.episodeNum}`,
-            season: ep.seasonNum, 
-            episode: ep.episodeNum, 
-            released: null
-        }));
-        // --- End Meta Logic ---
-
-        const metaResponse = {
-            meta: {
-                id, 
-                type: 'series', 
-                name: showName,
-                poster: showPoster, 
-                posterShape: 'poster', 
-                background: showBackground,
-                logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
-                description: 'מאקו VOD', 
-                videos
-            }
-        };
-
-        console.log(`Meta: Responding with ${videos.length} videos for ${showName}`);
-        res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=600');
-        res.setHeader('Content-Type', 'application/json');
-        res.status(200).json(metaResponse);
-
-     } catch (err) {
-         console.error(`Meta handler top-level error for ID ${req.params.id}:`, err);
-         res.status(500).json({ meta: null, error: 'Failed to process meta request' });
-     }
-});
-
-
-// Define stream endpoint
-app.get('/stream/:type/:id.json', async (req, res) => {
-     try {
-        const { type, id } = req.params;
-        console.log('Processing stream request:', { type, id });
-
-        if (type !== 'series' || !id.startsWith('mako:')) {
-            return res.status(404).json({ streams: [], err: 'Invalid stream ID format' });
-        }
-
-        const [showIdRaw, episodeGuid] = id.split(':ep:');
-        if (!showIdRaw || !episodeGuid) {
-            return res.status(400).json({ streams: [], err: 'Invalid stream ID format (missing GUID)' });
-        }
-
-        const showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
-        console.log(`Stream handler: Looking for GUID ${episodeGuid} within show ${showUrl}`);
-
-        // --- Stream Logic ---
-        let episodeUrl = null;
-        try {
-            // Load cache first
-            const cache = await loadCache();
-            const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
-
-            console.log(`Stream: Fetching seasons for ${showUrl} to find URL for GUID ${episodeGuid}`);
-            const seasons = await extractContent(showUrl, 'seasons');
-            let episodesFound = [];
-
-            if (!seasons || seasons.length === 0) {
-                episodesFound = await extractContent(showUrl, 'episodes');
-            } else {
-                // Process seasons in parallel with rate limiting
-                const batchSize = 5; // Process 5 seasons at a time
-                
-                for (let i = 0; i < seasons.length; i += batchSize) {
-                    const batch = seasons.slice(i, i + batchSize);
-                    const batchPromises = batch.map(async (season) => {
-                        const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
-                        console.log(`Stream: Processing season ${seasonNum}: ${season.name || season.url}`);
-                        
-                        // Check cache for season episodes
-                        const cacheKey = `season:${season.url}`;
-                        let episodes = null;
-                        
-                        if (cache.seasons && cache.seasons[cacheKey] && isCacheFresh) {
-                            console.log(`Stream: Using cached episodes for season ${seasonNum}`);
-                            episodes = cache.seasons[cacheKey];
-                        } else {
-                            // Increased timeout for episode fetching
-                            const response = await axios.get(season.url, { 
-                                headers: HEADERS, 
-                                timeout: REQUEST_TIMEOUT_MS * 2 // Double the timeout
-                            });
-                            episodes = await extractContent(season.url, 'episodes');
-                            // Cache the episodes
-                            if (!cache.seasons) cache.seasons = {};
-                            cache.seasons[cacheKey] = episodes;
-                        }
-                        
-                        return episodes;
-                    });
-                    
-                    const batchResults = await Promise.all(batchPromises);
-                    const flatEpisodes = batchResults.flat();
-                    episodesFound.push(...flatEpisodes);
-                    
-                    // Check if we found the episode in this batch
-                    const foundEpisode = flatEpisodes.find(ep => ep.guid === episodeGuid);
-                    if (foundEpisode) {
-                        episodeUrl = foundEpisode.url;
-                        console.log(`Stream handler: Found episode URL in season ${i/batchSize + 1}: ${episodeUrl}`);
-                        break; // Exit the loop once we find the episode
-                    }
-                    
-                    await sleep(50); // Small delay between batches
-                }
-            }
-
-            // If we haven't found the episode yet, check the episodes we found
-            if (!episodeUrl) {
-                const episode = episodesFound.find(ep => ep.guid === episodeGuid);
-                if (episode && episode.url) {
-                    episodeUrl = episode.url;
-                    console.log(`Stream handler: Found episode URL: ${episodeUrl}`);
-                } else {
-                    console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
-                    return res.status(404).json({ streams: [], err: 'Episode URL not found' });
-                }
-            }
-
-            // Save updated cache if needed
-            if (cache.seasons) {
-                await saveCache(cache);
-            }
-
-        } catch (error) {
-            console.error(`Stream handler: Error finding episode URL: ${error.message}`);
-            return res.status(500).json({ streams: [], err: 'Error finding episode URL' });
-        }
-
-        // Get the HLS Video URL
-        const videoUrl = await getVideoUrl(episodeUrl);
-        if (!videoUrl) {
-            console.error(`Stream handler: getVideoUrl failed for ${episodeUrl}`);
-            return res.status(500).json({ streams: [], err: 'Failed to retrieve video stream URL' });
-        }
-        console.log(`Stream handler: Got video URL: ${videoUrl}`);
-
-        const streams = [{
-            url: videoUrl,
-            title: 'Play',
-            type: 'hls', // Specify HLS stream type
-            behaviorHints: {
-                notWebReady: true, // Indicate this is not a web-ready stream
-                bingeGroup: 'mako-vod', // Group episodes for binge watching
-                videoSize: 1920, // Indicate HD quality
-                subtitleStreams: [], // No subtitles available
-                audioChannels: 'stereo'
-            }
-        }];
-
-        console.log(`Stream: Responding with stream for ${episodeGuid}`);
-        res.setHeader('Cache-Control', 'no-store, max-age=0'); // Do not cache stream URLs
-        res.setHeader('Content-Type', 'application/json');
-        res.status(200).json({ streams });
-
-     } catch (err) {
-         console.error(`Stream handler top-level error for ID ${req.params.id}:`, err);
-         res.status(500).json({ streams: [], error: 'Failed to process stream request' });
-     }
-});
-
 
 // Handle other requests (404)
 app.use((req, res) => {
     console.warn('Unknown request:', req.method, req.url);
     res.status(404).json({ error: 'Not Found' });
 });
+
+// Start background refresh when the app starts
+startBackgroundRefresh();
 
 // Export the app for Vercel
 module.exports = app;
