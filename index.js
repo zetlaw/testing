@@ -1053,9 +1053,9 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             return res.status(200).json({ metas: [] });
         }
 
-        // Load cache first
-        const cache = await loadCache();
-        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL_MS;
+        // Load metadata cache first
+        const metadataCache = await loadCache('metadata');
+        const isMetadataFresh = Date.now() - (metadataCache.timestamp || 0) < CACHE_TTL_MS;
 
         // Get initial shows list
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
@@ -1071,48 +1071,33 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             console.log(`Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
-        // Process only the first 50 shows initially
-        const initialShows = filteredShows.slice(0, 50);
-        const processedShows = [];
-
-        // Process initial shows using cache
-        for (const show of initialShows) {
-            try {
-                // Check cache first
-                if (cache.shows && cache.shows[show.url]) {
-                    const cachedData = cache.shows[show.url];
-                    processedShows.push({
-                        ...show,
-                        name: cachedData.name || show.name,
-                        poster: cachedData.poster || show.poster,
-                        background: cachedData.background || show.poster
-                    });
-                    console.log(`Catalog: Using cached data for ${cachedData.name || show.name}`);
-                    continue;
-                }
-
-                // If not in cache, use basic show info
-                processedShows.push(show);
-                console.log(`Catalog: Using basic info for ${show.name}`);
-            } catch (err) {
-                console.error(`Error processing show ${show.url}:`, err.message);
-                processedShows.push(show);
+        // Process shows using metadata cache
+        const processedShows = filteredShows.map(show => {
+            const metadata = metadataCache.metadata[show.url];
+            if (metadata && isMetadataFresh) {
+                return {
+                    ...show,
+                    name: metadata.name,
+                    poster: metadata.poster,
+                    background: metadata.background
+                };
             }
-        }
+            return null;
+        }).filter(show => show !== null); // Remove shows without valid metadata
 
         // Create meta objects
         const metas = processedShows.map(show => ({
             id: `mako:${encodeURIComponent(show.url)}`,
             type: 'series',
-            name: show.name || 'Loading...',
-            poster: show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+            name: show.name,
+            poster: show.poster,
             posterShape: 'poster',
-            background: show.background || show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+            background: show.background,
             logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
             description: 'מאקו VOD',
         }));
 
-        // Send response immediately
+        // Send response
         console.log(`Catalog: Responding with ${metas.length} metas`);
         res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600');
         res.setHeader('Content-Type', 'application/json');
