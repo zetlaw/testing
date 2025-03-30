@@ -665,31 +665,58 @@ builder.defineMetaHandler(async ({ type, id }) => {
             episodesToProcess = await extractContent(showUrl, 'episodes');
             if (episodesToProcess.length > 0) episodesToProcess.forEach((ep, i) => { ep.seasonNum = 1; ep.episodeNum = i + 1; });
         } else {
-            // Increased season limit and added progress tracking
-            const seasonLimit = process.env.NODE_ENV === 'production' ? 15 : 30; // Increased from 5/20
-            const seasonsToFetch = seasons.slice(0, seasonLimit);
-            const totalSeasons = seasons.length;
-            console.log(`Meta: Processing ${seasonsToFetch.length} out of ${totalSeasons} seasons for ${showName}`);
+            console.log(`Meta: Processing all ${seasons.length} seasons for ${showName}`);
             
-            if (seasonsToFetch.length < seasons.length) {
-                console.warn(`Meta: Limiting season processing to first ${seasonLimit} seasons.`);
-            }
-
-            let processedSeasons = 0;
-            for (const season of seasonsToFetch) {
-                processedSeasons++;
-                console.log(`Meta: Processing season ${processedSeasons}/${seasonsToFetch.length}: ${season.name || season.url}`);
-                const episodes = await extractContent(season.url, 'episodes');
-                const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
-                episodes.forEach((ep, i) => { 
-                    ep.seasonNum = seasonNum; 
-                    ep.episodeNum = i + 1; 
-                    episodesToProcess.push(ep); 
+            // Process seasons in parallel with rate limiting
+            const batchSize = 5; // Increased from 3 to 5 seasons at a time
+            const seasonBatches = [];
+            
+            for (let i = 0; i < seasons.length; i += batchSize) {
+                const batch = seasons.slice(i, i + batchSize);
+                const batchPromises = batch.map(async (season) => {
+                    const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
+                    console.log(`Meta: Processing season ${seasonNum}: ${season.name || season.url}`);
+                    
+                    // Check cache for season episodes
+                    const cacheKey = `season:${season.url}`;
+                    let episodes = null;
+                    
+                    if (cache.seasons && cache.seasons[cacheKey] && isCacheFresh) {
+                        console.log(`Meta: Using cached episodes for season ${seasonNum}`);
+                        episodes = cache.seasons[cacheKey];
+                    } else {
+                        // Increased timeout for episode fetching
+                        const response = await axios.get(season.url, { 
+                            headers: HEADERS, 
+                            timeout: REQUEST_TIMEOUT * 2 // Double the timeout
+                        });
+                        episodes = await extractContent(season.url, 'episodes');
+                        // Cache the episodes
+                        if (!cache.seasons) cache.seasons = {};
+                        cache.seasons[cacheKey] = episodes;
+                        needsSave = true;
+                    }
+                    
+                    episodes.forEach((ep, i) => { 
+                        ep.seasonNum = seasonNum; 
+                        ep.episodeNum = i + 1; 
+                    });
+                    
+                    console.log(`Meta: Added ${episodes.length} episodes from season ${seasonNum}`);
+                    return episodes;
                 });
-                console.log(`Meta: Added ${episodes.length} episodes from season ${seasonNum}`);
-                await sleep(50);
+                
+                const batchResults = await Promise.all(batchPromises);
+                episodesToProcess.push(...batchResults.flat());
+                await sleep(50); // Reduced delay between batches since we're processing more at once
             }
-            console.log(`Meta: Completed processing ${processedSeasons} seasons, total episodes: ${episodesToProcess.length}`);
+            
+            console.log(`Meta: Completed processing all ${seasons.length} seasons, total episodes: ${episodesToProcess.length}`);
+            
+            // Save updated cache if needed
+            if (needsSave) {
+                await saveCache(cache);
+            }
         }
 
         // Sort and map episodes
@@ -984,31 +1011,58 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             episodesToProcess = await extractContent(showUrl, 'episodes');
             if (episodesToProcess.length > 0) episodesToProcess.forEach((ep, i) => { ep.seasonNum = 1; ep.episodeNum = i + 1; });
         } else {
-            // Increased season limit and added progress tracking
-            const seasonLimit = process.env.NODE_ENV === 'production' ? 15 : 30; // Increased from 5/20
-            const seasonsToFetch = seasons.slice(0, seasonLimit);
-            const totalSeasons = seasons.length;
-            console.log(`Meta: Processing ${seasonsToFetch.length} out of ${totalSeasons} seasons for ${showName}`);
+            console.log(`Meta: Processing all ${seasons.length} seasons for ${showName}`);
             
-            if (seasonsToFetch.length < seasons.length) {
-                console.warn(`Meta: Limiting season processing to first ${seasonLimit} seasons.`);
-            }
-
-            let processedSeasons = 0;
-            for (const season of seasonsToFetch) {
-                processedSeasons++;
-                console.log(`Meta: Processing season ${processedSeasons}/${seasonsToFetch.length}: ${season.name || season.url}`);
-                const episodes = await extractContent(season.url, 'episodes');
-                const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
-                episodes.forEach((ep, i) => { 
-                    ep.seasonNum = seasonNum; 
-                    ep.episodeNum = i + 1; 
-                    episodesToProcess.push(ep); 
+            // Process seasons in parallel with rate limiting
+            const batchSize = 5; // Increased from 3 to 5 seasons at a time
+            const seasonBatches = [];
+            
+            for (let i = 0; i < seasons.length; i += batchSize) {
+                const batch = seasons.slice(i, i + batchSize);
+                const batchPromises = batch.map(async (season) => {
+                    const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
+                    console.log(`Meta: Processing season ${seasonNum}: ${season.name || season.url}`);
+                    
+                    // Check cache for season episodes
+                    const cacheKey = `season:${season.url}`;
+                    let episodes = null;
+                    
+                    if (cache.seasons && cache.seasons[cacheKey] && isCacheFresh) {
+                        console.log(`Meta: Using cached episodes for season ${seasonNum}`);
+                        episodes = cache.seasons[cacheKey];
+                    } else {
+                        // Increased timeout for episode fetching
+                        const response = await axios.get(season.url, { 
+                            headers: HEADERS, 
+                            timeout: REQUEST_TIMEOUT * 2 // Double the timeout
+                        });
+                        episodes = await extractContent(season.url, 'episodes');
+                        // Cache the episodes
+                        if (!cache.seasons) cache.seasons = {};
+                        cache.seasons[cacheKey] = episodes;
+                        needsSave = true;
+                    }
+                    
+                    episodes.forEach((ep, i) => { 
+                        ep.seasonNum = seasonNum; 
+                        ep.episodeNum = i + 1; 
+                    });
+                    
+                    console.log(`Meta: Added ${episodes.length} episodes from season ${seasonNum}`);
+                    return episodes;
                 });
-                console.log(`Meta: Added ${episodes.length} episodes from season ${seasonNum}`);
-                await sleep(50);
+                
+                const batchResults = await Promise.all(batchPromises);
+                episodesToProcess.push(...batchResults.flat());
+                await sleep(50); // Reduced delay between batches since we're processing more at once
             }
-            console.log(`Meta: Completed processing ${processedSeasons} seasons, total episodes: ${episodesToProcess.length}`);
+            
+            console.log(`Meta: Completed processing all ${seasons.length} seasons, total episodes: ${episodesToProcess.length}`);
+            
+            // Save updated cache if needed
+            if (needsSave) {
+                await saveCache(cache);
+            }
         }
 
         // Sort and map episodes
