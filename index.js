@@ -15,7 +15,7 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const DELAY_BETWEEN_REQUESTS_MS = 500;
 const REQUEST_TIMEOUT_MS = 10000;
 const EPISODE_FETCH_TIMEOUT_MS = 20000;
-const BATCH_SIZE = 5;
+const BATCH_SIZE = 10;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 // Detect if we're running in a serverless environment
@@ -247,8 +247,8 @@ const HEADERS = {
 };
 
 // --- Background Queue Configuration ---
-const QUEUE_BATCH_SIZE = 5;
-const QUEUE_DELAY_MS = 1000;
+const QUEUE_BATCH_SIZE = 10;
+const QUEUE_DELAY_MS = 500; // Reduced from 1000 to 500ms for faster processing
 const MAX_QUEUE_RETRIES = 3;
 
 // --- Metadata Functions ---
@@ -354,8 +354,8 @@ async function processMetadataQueue() {
     }
     lastQueueProcess = Date.now();
     
-    // For serverless environments, process a smaller batch to avoid timeouts and memory issues
-    const batchSize = IS_SERVERLESS ? Math.min(3, QUEUE_BATCH_SIZE) : QUEUE_BATCH_SIZE;
+    // Use consistent batch size regardless of environment
+    const batchSize = QUEUE_BATCH_SIZE;
     
     try {
         // Process a batch of items
@@ -413,20 +413,10 @@ async function processMetadataQueue() {
         
         // If there are more items, continue processing after a delay
         if (metadataQueue.length > 0) {
-            // In serverless environments, we need to be careful about recursive setTimeout calls
-            // as they can cause memory leaks if the function keeps running
-            const nextDelay = IS_SERVERLESS ? 
-                Math.max(QUEUE_DELAY_MS, 2000) : // Longer delay in serverless
-                QUEUE_DELAY_MS;
-                
-            // Limit the queue size in serverless environments to prevent memory issues
-            if (IS_SERVERLESS && metadataQueue.length > 100) {
-                console.log(`Pruning queue from ${metadataQueue.length} to 100 items to prevent memory issues`);
-                // Keep only the highest priority items
-                metadataQueue.sort((a, b) => b.priority - a.priority);
-                metadataQueue.splice(100);
-            }
+            // Use consistent delay regardless of environment
+            const nextDelay = QUEUE_DELAY_MS;
             
+            // Don't limit queue size anymore
             setTimeout(processMetadataQueue, nextDelay);
         }
     }
@@ -942,11 +932,11 @@ const getShowEpisodes = async (showUrl, metadataCache) => {
                     })()
                 );
 
-                if (seasonProcessingPromises.length >= BATCH_SIZE || index === seasons.length - 1) {
+                // Process all seasons in parallel instead of batching
+                if (index === seasons.length - 1) {
                     const batchResults = await Promise.all(seasonProcessingPromises);
                     allEpisodes.push(...batchResults.flat());
                     seasonProcessingPromises.length = 0;
-                    if(index < seasons.length -1) await sleep(100);
                 }
             }
             console.log(`Completed processing ${seasons.length} seasons, total episodes found: ${allEpisodes.length}`);
@@ -1331,19 +1321,18 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             console.log(`Catalog: Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
-        // OPTIMIZATION: Limit number of shows to prevent timeouts
-        // Only process the first 50 shows for initial response
-        const MAX_SHOWS_TO_PROCESS = IS_SERVERLESS ? 50 : 100;
+        // Don't limit number of shows to process
+        const MAX_SHOWS_TO_PROCESS = 100;
         let showsToProcess = filteredShows;
         let hasMoreShows = false;
         
         if (filteredShows.length > MAX_SHOWS_TO_PROCESS) {
             showsToProcess = filteredShows.slice(0, MAX_SHOWS_TO_PROCESS);
             hasMoreShows = true;
-            console.log(`Limiting initial response to ${MAX_SHOWS_TO_PROCESS} shows to avoid timeout`);
+            console.log(`Limiting initial response to ${MAX_SHOWS_TO_PROCESS} shows to maintain performance`);
         }
 
-        // Queue all shows for background processing, but prioritize the ones we're displaying now
+        // Queue all shows for background processing, prioritizing visible ones
         filteredShows.forEach((show, index) => {
             if (!show.url) return;
             // High priority for visible items, low for the rest
@@ -1352,12 +1341,12 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         });
 
         const metas = [];
-        // Use a smaller batch size for serverless environments
-        const effectiveBatchSize = IS_SERVERLESS ? 10 : BATCH_SIZE;
+        // Use consistent larger batch size
+        const effectiveBatchSize = BATCH_SIZE * 2;
         
-        // Start a timer to make sure we don't exceed time limits
+        // Set longer processing time
         const startTime = Date.now();
-        const MAX_PROCESSING_TIME_MS = IS_SERVERLESS ? 5000 : 30000; // 5 seconds for serverless
+        const MAX_PROCESSING_TIME_MS = 30000; // 30 seconds regardless of environment
         
         for (let i = 0; i < showsToProcess.length; i += effectiveBatchSize) {
             // Check if we're approaching the time limit
@@ -1389,20 +1378,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
                         };
                     }
                     
-                    // If we're in serverless, don't do direct fetches to avoid timeouts
-                    // just return basic info and let the background job fetch metadata
-                    if (IS_SERVERLESS) {
-                        return {
-                            id: `mako:${encodeURIComponent(show.url)}`,
-                            type: 'series',
-                            name: show.name || 'Loading...',
-                            poster: show.poster || DEFAULT_LOGO,
-                            posterShape: 'poster',
-                            logo: DEFAULT_LOGO,
-                        };
-                    }
-                    
-                    // If not in serverless, we can try a direct fetch
+                    // Always do direct fetch since we've removed serverless limitations
                     const fetchedMetadata = await getMetadata(show.url);
                     
                     return {
@@ -1434,13 +1410,13 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             // If we have too many shows and it's a search, just return what we have so far
             if (searchTerm && metas.length > 0 && i + effectiveBatchSize < showsToProcess.length && 
                 Date.now() - startTime > MAX_PROCESSING_TIME_MS / 2) {
-                console.log(`Returning ${metas.length} search results before processing all shows to avoid timeout`);
+                console.log(`Returning ${metas.length} search results before processing all shows to maintain responsiveness`);
                 break;
             }
 
             // Small pause between batches
             if (i + effectiveBatchSize < showsToProcess.length) {
-                await sleep(50); // Reduced from 100ms to 50ms
+                await sleep(50); // Keep minimal delay
             }
         }
 
@@ -1507,35 +1483,30 @@ app.get('/meta/:type/:id.json', async (req, res) => {
         // Process episodes for all seasons
         const allEpisodes = [];
         
-        // In serverless, limit to first 2 seasons to avoid timeouts
-        const seasonsToProcess = IS_SERVERLESS ? allSeasons.slice(0, 2) : allSeasons;
+        // Process all seasons in parallel (no more limiting to 2 seasons)
+        const seasonsToProcess = allSeasons;
         
-        for (const season of seasonsToProcess) {
+        // Load all seasons in parallel with Promise.all
+        const seasonEpisodePromises = seasonsToProcess.map(async (season) => {
             console.log(`Processing season ${season.seasonNum}: ${season.name}`);
             
             const episodes = await extractContent(season.url, 'episodes');
             if (episodes && episodes.length > 0) {
                 // Add season and episode numbers
-                const seasonEpisodes = episodes.map((ep, idx) => ({
+                return episodes.map((ep, idx) => ({
                     ...ep,
                     seasonNum: season.seasonNum,
                     episodeNum: idx + 1
                 }));
-                
-                allEpisodes.push(...seasonEpisodes);
-                console.log(`Added ${seasonEpisodes.length} episodes from season ${season.seasonNum}`);
             } else {
                 console.log(`No episodes found for season ${season.seasonNum}`);
+                return [];
             }
-            
-            // Add a small delay between season processing
-            await sleep(200);
-        }
+        });
         
-        // If we limited seasons due to serverless, log that info
-        if (IS_SERVERLESS && allSeasons.length > 2) {
-            console.log(`Note: Only processed ${seasonsToProcess.length} of ${allSeasons.length} seasons due to serverless environment limitations`);
-        }
+        // Wait for all season processing to complete
+        const allSeasonEpisodes = await Promise.all(seasonEpisodePromises);
+        allEpisodes.push(...allSeasonEpisodes.flat());
         
         // Sort episodes by season and episode number
         allEpisodes.sort((a, b) => {
@@ -1621,25 +1592,24 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             allSeasons = [{ name: "Season 1", url: showUrl }];
         }
         
-        // Search through each season for the episode
-        for (const season of allSeasons) {
+        // Search through all seasons simultaneously for the episode
+        const seasonSearchPromises = allSeasons.map(async (season) => {
             console.log(`Searching for episode in ${season.name}: ${season.url}`);
             const episodes = await extractContent(season.url, 'episodes');
             
             if (episodes && episodes.length > 0) {
                 const found = episodes.find(ep => ep.guid === episodeGuid);
                 if (found) {
-                    targetEpisode = found;
                     console.log(`Found episode in ${season.name}: ${found.name}`);
-                    break;
+                    return found;
                 }
             }
-            
-            // Don't sleep after the last season
-            if (season !== allSeasons[allSeasons.length - 1]) {
-                await sleep(200);
-            }
-        }
+            return null;
+        });
+        
+        // Wait for all season searches to complete
+        const results = await Promise.all(seasonSearchPromises);
+        targetEpisode = results.find(ep => ep !== null);
 
         if (!targetEpisode || !targetEpisode.url) {
             console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
