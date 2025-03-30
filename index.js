@@ -935,8 +935,53 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             console.log(`Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
-        // Create initial meta objects with basic info
-        const metas = filteredShows.map(show => ({
+        // Process only the first 50 shows initially
+        const initialShows = filteredShows.slice(0, 50);
+        const processedShows = [];
+
+        // Process initial shows
+        for (const show of initialShows) {
+            try {
+                // Check cache first
+                if (cache.shows && cache.shows[show.url] && isCacheFresh) {
+                    processedShows.push({
+                        ...show,
+                        name: cache.shows[show.url].name || show.name,
+                        poster: cache.shows[show.url].poster || show.poster,
+                        background: cache.shows[show.url].background || show.poster
+                    });
+                    continue;
+                }
+
+                // Fetch fresh details
+                const details = await extractShowName(show.url);
+                if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
+                    // Update cache
+                    if (!cache.shows) cache.shows = {};
+                    cache.shows[show.url] = {
+                        name: details.name,
+                        poster: details.poster,
+                        background: details.background,
+                        lastUpdated: Date.now()
+                    };
+                    processedShows.push({
+                        ...show,
+                        name: details.name,
+                        poster: details.poster,
+                        background: details.background
+                    });
+                } else {
+                    processedShows.push(show);
+                }
+                await sleep(100); // Small delay between requests
+            } catch (err) {
+                console.error(`Error processing show ${show.url}:`, err.message);
+                processedShows.push(show);
+            }
+        }
+
+        // Create meta objects
+        const metas = processedShows.map(show => ({
             id: `mako:${encodeURIComponent(show.url)}`,
             type: 'series',
             name: show.name || 'Loading...',
@@ -947,56 +992,57 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             description: 'מאקו VOD',
         }));
 
-        // Send response immediately with basic info
-        console.log(`Catalog: Responding with ${metas.length} metas (initial load)`);
+        // Send response
+        console.log(`Catalog: Responding with ${metas.length} metas`);
         res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600');
         res.setHeader('Content-Type', 'application/json');
         res.status(200).json({ metas });
 
-        // Process show details in the background
-        if (!isCacheFresh) {
-            console.log('Starting background processing of show details...');
+        // Process remaining shows in the background
+        if (filteredShows.length > 50 && !isCacheFresh) {
+            console.log('Starting background processing of remaining shows...');
+            const remainingShows = filteredShows.slice(50);
             const batchSize = 5;
-            const processedShows = [];
+            const backgroundProcessedShows = [];
 
-            for (let i = 0; i < filteredShows.length; i += batchSize) {
-                const batch = filteredShows.slice(i, i + batchSize);
+            for (let i = 0; i < remainingShows.length; i += batchSize) {
+                const batch = remainingShows.slice(i, i + batchSize);
                 const batchPromises = batch.map(async (show) => {
-                    // Skip if already in cache and fresh
-                    if (cache.shows && cache.shows[show.url] && isCacheFresh) {
-                        return null;
-                    }
+                    try {
+                        if (cache.shows && cache.shows[show.url] && isCacheFresh) {
+                            return null;
+                        }
 
-                    // Fetch fresh details
-                    console.log(`Background: Fetching details for ${show.url}`);
-                    const details = await extractShowName(show.url);
-                    if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
-                        // Update cache
-                        if (!cache.shows) cache.shows = {};
-                        cache.shows[show.url] = {
-                            name: details.name,
-                            poster: details.poster,
-                            background: details.background,
-                            lastUpdated: Date.now()
-                        };
-                        return {
-                            ...show,
-                            name: details.name,
-                            poster: details.poster,
-                            background: details.background
-                        };
+                        const details = await extractShowName(show.url);
+                        if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
+                            if (!cache.shows) cache.shows = {};
+                            cache.shows[show.url] = {
+                                name: details.name,
+                                poster: details.poster,
+                                background: details.background,
+                                lastUpdated: Date.now()
+                            };
+                            return {
+                                ...show,
+                                name: details.name,
+                                poster: details.poster,
+                                background: details.background
+                            };
+                        }
+                    } catch (err) {
+                        console.error(`Background error processing show ${show.url}:`, err.message);
                     }
                     return null;
                 });
 
                 const batchResults = await Promise.all(batchPromises);
-                processedShows.push(...batchResults.filter(Boolean));
+                backgroundProcessedShows.push(...batchResults.filter(Boolean));
                 await sleep(100);
             }
 
             // Save updated cache if we processed any shows
-            if (processedShows.length > 0) {
-                console.log(`Background: Processed ${processedShows.length} shows, saving cache...`);
+            if (backgroundProcessedShows.length > 0) {
+                console.log(`Background: Processed ${backgroundProcessedShows.length} shows, saving cache...`);
                 await saveCache(cache);
             }
         }
