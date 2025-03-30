@@ -430,7 +430,6 @@ const getVideoUrl = async (episodeUrl) => {
     console.log(`getVideoUrl: Starting process for episode URL: ${episodeUrl}`);
     try {
         // 1. Fetch Episode Page HTML
-        // console.log(`getVideoUrl: Fetching episode page HTML...`);
         const episodePageResponse = await axios.get(episodeUrl, {
             headers: HEADERS, timeout: REQUEST_TIMEOUT, responseType: 'text'
         });
@@ -445,12 +444,10 @@ const getVideoUrl = async (episodeUrl) => {
             const vod = data?.props?.pageProps?.data?.vod || {};
             details = { vcmid: vod.itemVcmId, galleryChannelId: vod.galleryChannelId, videoChannelId: vod.channelId };
             if (!details.vcmid || !details.galleryChannelId || !details.videoChannelId) { console.error("getVideoUrl: Error - Missing required video details:", details); return null; }
-            // console.log("getVideoUrl: Successfully extracted video details:", details);
         } catch (e) { console.error("getVideoUrl: Error parsing __NEXT_DATA__ JSON:", e); return null; }
 
         // 3. Construct Playlist URL
         const ajaxUrl = `${BASE_URL}/AjaxPage?jspName=playlist12.jsp&vcmid=${details.vcmid}&videoChannelId=${details.videoChannelId}&galleryChannelId=${details.galleryChannelId}&consumer=responsive`;
-        // console.log(`getVideoUrl: Fetching encrypted playlist from: ${ajaxUrl}`);
 
         // 4. Fetch as ArrayBuffer and Sanitize Base64 Input
         const playlistResponse = await axios.get(ajaxUrl, {
@@ -464,7 +461,6 @@ const getVideoUrl = async (episodeUrl) => {
         const base64CharsRegex = /[^A-Za-z0-9+/=]/g;
         const encryptedDataClean = rawText.replace(base64CharsRegex, '');
         if (!encryptedDataClean) { console.error("getVideoUrl: Error - Playlist data was empty after cleaning."); return null; }
-        // console.log(`getVideoUrl: Cleaned Base64 playlist data length: ${encryptedDataClean.length}`);
 
         // 5. Decrypt Playlist Data
         const decrypted = cryptoOp(encryptedDataClean, "decrypt", "playlist");
@@ -474,21 +470,18 @@ const getVideoUrl = async (episodeUrl) => {
         let playlistData;
         try {
             playlistData = JSON.parse(decrypted);
-            // console.log("getVideoUrl: Successfully parsed playlist data");
-        } catch (e) { console.error("getVideoUrl: Error parsing decrypted JSON:", e.message); /* ... log snippet ... */ return null; }
+        } catch (e) { console.error("getVideoUrl: Error parsing decrypted JSON:", e.message); return null; }
 
         // 7. Extract HLS URL
         const media = playlistData.media || [];
         const hlsUrl = media[0]?.url;
         if (!hlsUrl) { console.error("getVideoUrl: No media URL found in playlist data"); return null; }
-        // console.log("getVideoUrl: Found HLS URL:", hlsUrl);
 
         // 8. Prepare Entitlement Payload
         let payload;
-         try {
-             payload = JSON.stringify({ lp: new URL(hlsUrl).pathname, rv: "AKAMAI" });
-         } catch(urlError) { /* ... error handling ... */ return hlsUrl; }
-        // console.log("getVideoUrl: Prepared entitlement payload:", payload);
+        try {
+            payload = JSON.stringify({ lp: new URL(hlsUrl).pathname, rv: "AKAMAI" });
+        } catch(urlError) { return hlsUrl; }
 
         // 9. Encrypt Entitlement Payload
         const encryptedPayload = cryptoOp(payload, "encrypt", "entitlement");
@@ -500,11 +493,11 @@ const getVideoUrl = async (episodeUrl) => {
             timeout: REQUEST_TIMEOUT,
             responseType: 'text'
         });
-        if (!entitlementResponse.data || !entitlementResponse.data.trim()) { /* ... log & return hlsUrl ... */ return hlsUrl; }
+        if (!entitlementResponse.data || !entitlementResponse.data.trim()) { return hlsUrl; }
 
         // 11. Clean and Decrypt Entitlement Response
         const entitlementEncryptedClean = entitlementResponse.data.replace(base64CharsRegex, '');
-        if (!entitlementEncryptedClean) { /* ... error handling ... */ return hlsUrl; }
+        if (!entitlementEncryptedClean) { return hlsUrl; }
         const entitlementDecrypted = cryptoOp(entitlementEncryptedClean, "decrypt", "entitlement");
         if (!entitlementDecrypted) { console.error("getVideoUrl: Failed to decrypt entitlement response"); return hlsUrl; }
 
@@ -512,7 +505,7 @@ const getVideoUrl = async (episodeUrl) => {
         let entitlementData;
         try {
             entitlementData = JSON.parse(entitlementDecrypted);
-        } catch (e) { /* ... error handling ... */ return hlsUrl; }
+        } catch (e) { return hlsUrl; }
 
         // 13. Extract and Append Ticket
         const tickets = entitlementData.tickets || [];
