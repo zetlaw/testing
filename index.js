@@ -707,13 +707,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
             console.log(`Catalog: Returning full list (found ${shows.length} valid shows initially)`);
         }
 
-        // Limit results significantly in production unless searching
-        const limit = process.env.NODE_ENV === 'production' && !search ? 50 : 200;
-        if (filteredShows.length > limit) {
-            console.log(`Catalog: Limiting results from ${filteredShows.length} to ${limit}`);
-            filteredShows = filteredShows.slice(0, limit);
-        }
-
+        // Remove the limit on shows
         const metas = filteredShows.map(show => ({
             id: `mako:${encodeURIComponent(show.url)}`,
             type: 'series',
