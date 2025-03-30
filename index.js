@@ -814,7 +814,6 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         try { extra.search = decodeURIComponent(req.params.extra.split('search=')[1].split('/')[0]); } // Extract search term more robustly
         catch (e) { console.warn("Failed to parse search extra:", req.params.extra); }
     }
-    // console.log('Processing catalog request via Express:', { type, id, extra }); // Reduce noise
 
     if (type !== 'series' || id !== 'mako-vod-shows') {
         console.log('Invalid catalog request.');
@@ -824,9 +823,9 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
     let cacheNeedsSave = false;
 
     try {
-        // Load MAIN cache (show list)
+        // Load both caches
         const mainCache = await loadCache('main');
-        const metadataCache = await loadCache('metadata'); // Also load metadata cache for lookups
+        const metadataCache = await loadCache('metadata');
 
         // Fetch initial show list (URLs, initial names/posters)
         const initialShows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
@@ -841,38 +840,60 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         }
 
         const metas = [];
-        // Iterate through filtered shows and enrich with metadata cache
-        for (const show of filteredShows) {
-             if (!show.url) continue;
+        // Process shows in batches to avoid overwhelming the server
+        const BATCH_SIZE = 5;
+        for (let i = 0; i < filteredShows.length; i += BATCH_SIZE) {
+            const batch = filteredShows.slice(i, i + BATCH_SIZE);
+            const batchPromises = batch.map(async (show) => {
+                if (!show.url) return null;
 
-             // Use metadata cache (don't trigger fetch here, meta handler will do that)
-             const cachedMeta = metadataCache.metadata?.[show.url];
-             const name = cachedMeta?.name || show.name || 'Loading...'; // Prioritize cached name
-             const poster = cachedMeta?.poster || show.poster || DEFAULT_LOGO;
-             const background = cachedMeta?.background || poster;
+                // Try to get metadata from cache first
+                let showDetails = metadataCache.metadata?.[show.url];
+                
+                // If no cached metadata or it's stale, fetch it
+                if (!showDetails || Date.now() - (showDetails.lastUpdated || 0) > CACHE_TTL_MS) {
+                    console.log(`Catalog: Fetching metadata for ${show.url}`);
+                    const { details } = await getOrUpdateShowMetadata(show.url, metadataCache);
+                    showDetails = details;
+                    cacheNeedsSave = true;
+                }
 
-             // If searching, perform secondary filter based on potentially cached name
-             if (extra.search && name !== 'Loading...' && !name.toLowerCase().includes(extra.search.toLowerCase())) {
-                  continue;
-             }
+                // If searching, perform secondary filter based on fetched name
+                if (extra.search && showDetails.name && !showDetails.name.toLowerCase().includes(extra.search.toLowerCase())) {
+                    return null;
+                }
 
-             metas.push({
-                 id: `mako:${encodeURIComponent(show.url)}`,
-                 type: 'series',
-                 name: name,
-                 poster: poster,
-                 posterShape: 'poster',
-                 background: background,
-                 logo: DEFAULT_LOGO,
-                 description: cachedMeta?.description || 'מאקו VOD',
-             });
+                return {
+                    id: `mako:${encodeURIComponent(show.url)}`,
+                    type: 'series',
+                    name: showDetails.name || show.name || 'Loading...',
+                    poster: showDetails.poster || show.poster || DEFAULT_LOGO,
+                    posterShape: 'poster',
+                    background: showDetails.background || showDetails.poster || show.poster || DEFAULT_LOGO,
+                    logo: DEFAULT_LOGO,
+                    description: showDetails.description || 'מאקו VOD',
+                };
+            });
+
+            const batchResults = await Promise.all(batchPromises);
+            metas.push(...batchResults.filter(Boolean));
+
+            // Add a small delay between batches to avoid overwhelming the server
+            if (i + BATCH_SIZE < filteredShows.length) {
+                await sleep(100);
+            }
         }
 
         console.log(`Catalog: Responding with ${metas.length} metas.`);
         res.setHeader('Content-Type', 'application/json');
-        // Shorter cache for catalog as it relies on potentially stale metadata lookups
         res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300'); // Cache for 15 mins
         res.status(200).json({ metas });
+
+        // Save cache if it was updated
+        if (cacheNeedsSave) {
+            console.log("Catalog: Saving updated metadata cache...");
+            await saveCache(metadataCache, 'metadata');
+        }
 
         // --- Background Update Check (Optional but good practice) ---
         // Check freshness of the *main* show list cache
