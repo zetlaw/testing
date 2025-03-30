@@ -1238,29 +1238,24 @@ builder.defineStreamHandler(async ({ type, id }) => {
             return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
         }
 
-        // Create a base64 token from the HLS URL
-        const proxyToken = Buffer.from(videoUrl).toString('base64');
-        
-        // Get the host from request and ensure it uses HTTPS
-        const host = req.get('host');
-        // Force HTTPS for the baseUrl regardless of the original request protocol
-        const baseUrl = `https://${host}`;
-        
-        // Create a proxied URL
-        const proxiedUrl = `${baseUrl}/proxy/${proxyToken}`;
-
-        console.log(`Original URL: ${videoUrl}`);
-        console.log(`Proxied URL: ${proxiedUrl}`);
+        // Return the direct URL without proxying
+        console.log(`Original video URL: ${videoUrl}`);
 
         const result = {
             streams: [{
-                url: proxiedUrl,
+                url: videoUrl, // Direct URL to the HLS playlist
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
                 mimeType: 'application/vnd.apple.mpegurl',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
-                    notWebReady: false
+                    notWebReady: false,
+                    // Tell Stremio to directly access the source
+                    headers: {
+                        'User-Agent': USER_AGENT,
+                        'Referer': 'https://www.mako.co.il/',
+                        'Origin': 'https://www.mako.co.il'
+                    }
                 }
             }]
         };
@@ -1786,29 +1781,24 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
         }
 
-        // Create a base64 token from the HLS URL
-        const proxyToken = Buffer.from(videoUrl).toString('base64');
-        
-        // Get the host from request and ensure it uses HTTPS
-        const host = req.get('host');
-        // Force HTTPS for the baseUrl regardless of the original request protocol
-        const baseUrl = `https://${host}`;
-        
-        // Create a proxied URL
-        const proxiedUrl = `${baseUrl}/proxy/${proxyToken}`;
-
-        console.log(`Original URL: ${videoUrl}`);
-        console.log(`Proxied URL: ${proxiedUrl}`);
+        // Return the direct URL without proxying
+        console.log(`Original video URL: ${videoUrl}`);
 
         const result = {
             streams: [{
-                url: proxiedUrl,
+                url: videoUrl, // Direct URL to the HLS playlist
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
                 mimeType: 'application/vnd.apple.mpegurl',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
-                    notWebReady: false
+                    notWebReady: false,
+                    // Tell Stremio to directly access the source
+                    headers: {
+                        'User-Agent': USER_AGENT,
+                        'Referer': 'https://www.mako.co.il/',
+                        'Origin': 'https://www.mako.co.il'
+                    }
                 }
             }]
         };
