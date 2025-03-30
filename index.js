@@ -168,12 +168,35 @@ const saveCache = async (cache) => {
     if (blob) { // Only attempt blob if it was initialized successfully
         try {
             console.log(`Attempting to save cache (${Object.keys(cache.shows).length} shows, ${Object.keys(cache.seasons).length} seasons) to Blob: ${BLOB_CACHE_KEY}`);
-            // Uploading JSON requires stringifying it
+            
+            // Save new cache file
             await blob.put(BLOB_CACHE_KEY, JSON.stringify(cache), {
                 access: 'public',
                 contentType: 'application/json'
             });
             console.log("Cache saved successfully to Vercel Blob");
+
+            // Clean up old cache files
+            try {
+                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY });
+                if (blobs && blobs.length > 1) {
+                    // Sort by lastModified, keep the most recent 2 files
+                    const sortedBlobs = blobs.sort((a, b) => b.lastModified - a.lastModified);
+                    const blobsToDelete = sortedBlobs.slice(2);
+                    
+                    // Delete old cache files
+                    for (const oldBlob of blobsToDelete) {
+                        try {
+                            await blob.del(oldBlob.pathname);
+                            console.log(`Deleted old cache file: ${oldBlob.pathname}`);
+                        } catch (delError) {
+                            console.error(`Failed to delete old cache file ${oldBlob.pathname}:`, delError);
+                        }
+                    }
+                }
+            } catch (cleanupError) {
+                console.error("Failed to clean up old cache files:", cleanupError);
+            }
         } catch (e) {
             console.error("Error saving cache to Blob storage:", e.message);
         }
