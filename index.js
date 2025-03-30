@@ -792,61 +792,107 @@ app.get('/', (req, res) => res.redirect('/manifest.json'));
 
 // Catalog endpoint
 app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
-    // ** Add Top Level Try/Catch **
     try {
         const { type, id } = req.params;
         let extra = {};
-        // Basic parsing for search=... format
         if (req.params.extra && req.params.extra.includes('search=')) {
-             try { extra.search = decodeURIComponent(req.params.extra.split('search=')[1]); }
-             catch(e){ console.warn("Failed to parse search extra:", req.params.extra); }
+            try { extra.search = decodeURIComponent(req.params.extra.split('search=')[1]); }
+            catch(e){ console.warn("Failed to parse search extra:", req.params.extra); }
         }
         console.log('Processing catalog request:', { type, id, extra });
 
         if (type !== 'series' || id !== 'mako-vod-shows') {
-             console.log('Invalid catalog request, returning empty.');
+            console.log('Invalid catalog request, returning empty.');
             return res.status(200).json({ metas: [] });
         }
 
-        // --- Catalog Logic ---
+        // Load cache first
+        const cache = await loadCache();
+        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
+
+        // Get initial shows list
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
-        const search = extra?.search?.toLowerCase() || '';
-        let filteredShows = shows;
-        if (search) {
-            console.log(`Catalog: Searching for '${search}'`);
-            filteredShows = shows.filter(show => show.name && show.name.toLowerCase().includes(search));
-            console.log(`Catalog: Found ${filteredShows.length} matching search results`);
-        } else {
-             console.log(`Catalog: Returning full list (found ${shows.length} valid shows initially)`);
+        console.log(`Extracted ${shows.length} initial shows`);
+
+        // Process show details in parallel with limits
+        const batchSize = 5; // Process 5 shows at a time
+        const maxShows = process.env.NODE_ENV === 'production' ? 50 : 200;
+        const showsToProcess = shows.slice(0, maxShows);
+        const processedShows = [];
+
+        for (let i = 0; i < showsToProcess.length; i += batchSize) {
+            const batch = showsToProcess.slice(i, i + batchSize);
+            const batchPromises = batch.map(async (show) => {
+                // Check cache first
+                if (cache.shows && cache.shows[show.url] && isCacheFresh) {
+                    console.log(`Using cached details for ${show.url}`);
+                    return {
+                        ...show,
+                        name: cache.shows[show.url].name || show.name,
+                        poster: cache.shows[show.url].poster || show.poster,
+                        background: cache.shows[show.url].background || show.poster
+                    };
+                }
+
+                // Fetch fresh details if not in cache or cache is stale
+                console.log(`Fetching fresh details for ${show.url}`);
+                const details = await extractShowName(show.url);
+                if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
+                    // Update cache
+                    if (!cache.shows) cache.shows = {};
+                    cache.shows[show.url] = {
+                        name: details.name,
+                        poster: details.poster,
+                        background: details.background,
+                        lastUpdated: Date.now()
+                    };
+                    return {
+                        ...show,
+                        name: details.name,
+                        poster: details.poster,
+                        background: details.background
+                    };
+                }
+                return show;
+            });
+
+            const batchResults = await Promise.all(batchPromises);
+            processedShows.push(...batchResults);
+            await sleep(100); // Small delay between batches
         }
 
-        // Limit results significantly in production unless searching
-        const limit = process.env.NODE_ENV === 'production' && !search ? 50 : 200; // Limit non-search more
-        if (filteredShows.length > limit) {
-            console.log(`Catalog: Limiting results from ${filteredShows.length} to ${limit}`);
-            filteredShows = filteredShows.slice(0, limit);
+        // Save updated cache
+        await saveCache(cache);
+
+        // Filter based on search if needed
+        let filteredShows = processedShows;
+        if (extra?.search) {
+            const search = extra.search.toLowerCase();
+            filteredShows = processedShows.filter(show => 
+                show.name && show.name.toLowerCase().includes(search)
+            );
+            console.log(`Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
+        // Create meta objects
         const metas = filteredShows.map(show => ({
             id: `mako:${encodeURIComponent(show.url)}`,
             type: 'series',
-            name: show.name || 'Loading...', // Use name from extractContent
-            poster: show.poster, // Use poster from extractContent
+            name: show.name || 'Loading...',
+            poster: show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
             posterShape: 'poster',
-            background: show.background, // Use background from extractContent
+            background: show.background || show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
             logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
             description: 'מאקו VOD',
         }));
-        // --- End Catalog Logic ---
 
-        console.log(`Catalog: Responding with ${metas.length} metas.`);
-        res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600'); // Cache catalog for 30 mins
+        console.log(`Catalog: Responding with ${metas.length} metas`);
+        res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=600');
         res.setHeader('Content-Type', 'application/json');
         res.status(200).json({ metas });
 
-    } catch (err) { // ** Catch unexpected errors **
-        console.error('Catalog handler top-level error:', err);
-        // Send valid empty response on error
+    } catch (err) {
+        console.error('Catalog handler error:', err);
         res.status(500).json({ metas: [], error: 'Failed to process catalog request' });
     }
 });
