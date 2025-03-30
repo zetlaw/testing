@@ -1238,16 +1238,33 @@ builder.defineStreamHandler(async ({ type, id }) => {
             return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
         }
 
-        // Return the direct URL without proxying
         console.log(`Original video URL: ${videoUrl}`);
+        
+        // Detect if the URL is from Cloudfront or similar CDN that needs proxying
+        const needsProxy = videoUrl.includes('cloudfront.net') || 
+                          videoUrl.includes('akamaized.net') || 
+                          videoUrl.includes('akamai');
+        
+        let streamUrl = videoUrl;
+        const host = req.get('host');
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        
+        if (needsProxy) {
+            // Create a base64 token from the HLS URL for proxying
+            const proxyToken = Buffer.from(videoUrl).toString('base64');
+            // Generate the proxy URL for this server
+            streamUrl = `${protocol}://${host}/proxy/${proxyToken}`;
+            console.log(`Using proxied URL for CDN content: ${streamUrl}`);
+        } else {
+            console.log(`Using direct URL for content: ${streamUrl}`);
+        }
 
         // Send the streams
         const result = {
             streams: [
                 {
-                    // Native HLS direct stream - for desktop/mobile players 
-                    url: videoUrl,
-                    title: `Play: ${targetEpisode.name || 'Episode'} (Direct)`,
+                    url: streamUrl,
+                    title: `Play: ${targetEpisode.name || 'Episode'} ${needsProxy ? '(Proxied)' : '(Direct)'}`,
                     type: 'hls',
                     mimeType: 'application/vnd.apple.mpegurl',
                     behaviorHints: {
@@ -1258,9 +1275,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
                             'Referer': 'https://www.mako.co.il/',
                             'Origin': 'https://www.mako.co.il'
                         },
-                        cors: true, // Signal that CORS is likely needed
+                        cors: true,
                         forceTranscode: false,
-                        trustURLAuth: true // Trust the URL authentication parameters
+                        trustURLAuth: true
                     }
                 }
             ]
@@ -1320,19 +1337,28 @@ app.get('/proxy/:token', async (req, res) => {
         
         console.log(`Proxying request to: ${originalUrl}`);
         
+        // Prepare custom headers based on the domain
+        const customHeaders = {
+            'User-Agent': USER_AGENT,
+            'Referer': 'https://www.mako.co.il/',
+            'Origin': 'https://www.mako.co.il',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9,he;q=0.8'
+        };
+        
+        // Add special handling for Cloudfront
+        if (originalUrl.includes('cloudfront.net')) {
+            console.log('CloudFront URL detected, adding specific headers');
+            customHeaders['Host'] = new URL(originalUrl).host;
+        }
+        
         // Forward the request to the original URL
         const response = await axios({
             method: 'get',
             url: originalUrl,
             responseType: 'arraybuffer',
             timeout: 30000,
-            headers: {
-                'User-Agent': USER_AGENT,
-                'Referer': 'https://www.mako.co.il/',
-                'Origin': 'https://www.mako.co.il',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9,he;q=0.8'
-            }
+            headers: customHeaders
         });
         
         // Set comprehensive CORS headers
@@ -1340,6 +1366,9 @@ app.get('/proxy/:token', async (req, res) => {
         res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range, Authorization');
         res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type');
+        
+        // Explicitly add Vary: Origin to help with caching
+        res.setHeader('Vary', 'Origin');
         
         // Forward important headers from the original response
         for (const [key, value] of Object.entries(response.headers)) {
@@ -1365,6 +1394,9 @@ app.get('/proxy/:token', async (req, res) => {
                 
                 // Replace any relative URLs with absolute ones
                 const baseUrl = originalUrl.substring(0, originalUrl.lastIndexOf('/') + 1);
+                const host = req.get('host');
+                const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+                
                 const modifiedContent = content
                     .split('\n')
                     .map(line => {
@@ -1378,21 +1410,19 @@ app.get('/proxy/:token', async (req, res) => {
                         if (!line.startsWith('http')) {
                             const absoluteUrl = new URL(line, baseUrl).href;
                             
-                            // If it's another m3u8 file, proxy it too
-                            if (line.includes('.m3u8')) {
+                            // If it's another m3u8 file or ts segment, proxy it too
+                            if (line.includes('.m3u8') || (originalUrl.includes('cloudfront.net') && line.includes('.ts'))) {
                                 const proxyToken = Buffer.from(absoluteUrl).toString('base64');
-                                // Force HTTPS for the proxy URL regardless of the original request protocol
-                                return `https://${req.get('host')}/proxy/${proxyToken}`;
+                                return `${protocol}://${host}/proxy/${proxyToken}`;
                             }
                             
                             return absoluteUrl;
                         }
                         
-                        // If it's already an absolute URL that is a playlist, proxy it
-                        if (line.includes('.m3u8')) {
+                        // If it's already an absolute URL that is a playlist or ts segment, proxy it
+                        if (line.includes('.m3u8') || (originalUrl.includes('cloudfront.net') && line.includes('.ts'))) {
                             const proxyToken = Buffer.from(line).toString('base64');
-                            // Force HTTPS for the proxy URL
-                            return `https://${req.get('host')}/proxy/${proxyToken}`;
+                            return `${protocol}://${host}/proxy/${proxyToken}`;
                         }
                         
                         return line;
@@ -1412,7 +1442,14 @@ app.get('/proxy/:token', async (req, res) => {
         
     } catch (error) {
         console.error('Proxy error:', error.message);
-        res.status(500).send('Error proxying video stream');
+        if (error.response) {
+            console.error(`Status: ${error.response.status}`);
+            // Try to forward original error response status if available
+            res.status(error.response.status);
+        } else {
+            res.status(500);
+        }
+        res.send('Error proxying video stream');
     }
 });
 
@@ -1787,16 +1824,33 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
         }
 
-        // Return the direct URL without proxying
         console.log(`Original video URL: ${videoUrl}`);
+        
+        // Detect if the URL is from Cloudfront or similar CDN that needs proxying
+        const needsProxy = videoUrl.includes('cloudfront.net') || 
+                          videoUrl.includes('akamaized.net') || 
+                          videoUrl.includes('akamai');
+        
+        let streamUrl = videoUrl;
+        const host = req.get('host');
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        
+        if (needsProxy) {
+            // Create a base64 token from the HLS URL for proxying
+            const proxyToken = Buffer.from(videoUrl).toString('base64');
+            // Generate the proxy URL for this server
+            streamUrl = `${protocol}://${host}/proxy/${proxyToken}`;
+            console.log(`Using proxied URL for CDN content: ${streamUrl}`);
+        } else {
+            console.log(`Using direct URL for content: ${streamUrl}`);
+        }
 
         // Send the streams
         const result = {
             streams: [
                 {
-                    // Native HLS direct stream - for desktop/mobile players 
-                    url: videoUrl,
-                    title: `Play: ${targetEpisode.name || 'Episode'} (Direct)`,
+                    url: streamUrl,
+                    title: `Play: ${targetEpisode.name || 'Episode'} ${needsProxy ? '(Proxied)' : '(Direct)'}`,
                     type: 'hls',
                     mimeType: 'application/vnd.apple.mpegurl',
                     behaviorHints: {
@@ -1807,9 +1861,9 @@ app.get('/stream/:type/:id.json', async (req, res) => {
                             'Referer': 'https://www.mako.co.il/',
                             'Origin': 'https://www.mako.co.il'
                         },
-                        cors: true, // Signal that CORS is likely needed
+                        cors: true,
                         forceTranscode: false,
-                        trustURLAuth: true // Trust the URL authentication parameters
+                        trustURLAuth: true
                     }
                 }
             ]
