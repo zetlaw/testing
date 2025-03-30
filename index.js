@@ -34,6 +34,7 @@ if (process.env.NODE_ENV === 'production') {
 
 const BASE_URL = "https://www.mako.co.il";
 const LOCAL_CACHE_FILE = path.join(__dirname, "mako_shows_cache.json"); // Keep for local dev
+const LOCAL_METADATA_FILE = path.join(__dirname, "mako_shows_metadata.json"); // Keep for local dev
 const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
 const CACHE_TTL_MS = CACHE_TTL; // Alias for consistency
 const DELAY_BETWEEN_REQUESTS_MS = 500; // 0.5 second delay
@@ -41,8 +42,9 @@ const REQUEST_TIMEOUT_MS = 10000; // 10 seconds for axios requests
 const EPISODE_FETCH_TIMEOUT_MS = 20000; // Longer timeout for episode fetches
 
 // --- Cache Storage Constants ---
-const BLOB_CACHE_KEY = 'mako-shows-cache-v1.json'; // Use a single, consistent filename
-const MAX_BLOB_FILES_TO_KEEP = 1; // Keep only the most recent cache file
+const BLOB_CACHE_KEY = 'mako-shows-cache-v1.json'; // Main cache for show list
+const BLOB_METADATA_KEY = 'mako-shows-metadata-v1.json'; // Separate cache for show metadata
+const MAX_BLOB_FILES_TO_KEEP = 1;
 
 // Headers for requests
 const HEADERS = {
@@ -56,35 +58,46 @@ const HEADERS = {
 // In-memory cache (simple version)
 let memoryCache = null;
 let memoryCacheTimestamp = 0;
+let memoryMetadataCache = null;
+let memoryMetadataTimestamp = 0;
 
 // --- Cache Management Functions ---
-const ensureCacheStructure = (cacheData) => {
+const ensureCacheStructure = (cacheData, type = 'main') => {
     if (typeof cacheData !== 'object' || cacheData === null) {
-        return { timestamp: 0, shows: {}, seasons: {} };
+        return type === 'main' 
+            ? { timestamp: 0, shows: {} }
+            : { timestamp: 0, metadata: {} };
     }
-    cacheData.shows = cacheData.shows || {};
-    cacheData.seasons = cacheData.seasons || {};
-    cacheData.timestamp = cacheData.timestamp || 0;
+    
+    if (type === 'main') {
+        cacheData.shows = cacheData.shows || {};
+        cacheData.timestamp = cacheData.timestamp || 0;
+    } else {
+        cacheData.metadata = cacheData.metadata || {};
+        cacheData.timestamp = cacheData.timestamp || 0;
+    }
+    
     return cacheData;
 };
 
-const loadCache = async () => {
+const loadCache = async (type = 'main') => {
     const now = Date.now();
     // Return recent memory cache immediately (cache memory for 1 min)
     if (memoryCache && (now - memoryCacheTimestamp < 60 * 1000)) {
-        return memoryCache;
+        return type === 'main' ? memoryCache : memoryMetadataCache;
     }
 
     let loadedData = null;
-    const emptyCache = ensureCacheStructure(null);
+    const emptyCache = ensureCacheStructure(null, type);
+    const cacheKey = type === 'main' ? BLOB_CACHE_KEY : BLOB_METADATA_KEY;
 
     if (blob) { // Production with Vercel Blob
         try {
-            console.log(`Attempting to load cache blob: ${BLOB_CACHE_KEY}`);
+            console.log(`Attempting to load ${type} cache blob: ${cacheKey}`);
             
             try {
                 // List blobs to get the URL
-                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY });
+                const { blobs } = await blob.list({ prefix: cacheKey });
                 
                 if (blobs && blobs.length > 0) {
                     // Get the most recent blob
@@ -93,114 +106,130 @@ const loadCache = async () => {
                         .sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))[0];
                     
                     if (mostRecent && mostRecent.url) {
-                        console.log(`Found cache blob: ${mostRecent.pathname}`);
+                        console.log(`Found ${type} cache blob: ${mostRecent.pathname}`);
                         const response = await axios.get(mostRecent.url, { 
                             timeout: REQUEST_TIMEOUT_MS + 5000 
                         });
                         
                         if (response.data && typeof response.data === 'object') {
                             loadedData = response.data;
-                            console.log(`Successfully loaded cache from Blob: ${mostRecent.pathname}`);
+                            console.log(`Successfully loaded ${type} cache from Blob: ${mostRecent.pathname}`);
                         } else {
-                            console.warn(`Found cache blob ${mostRecent.pathname} but content was invalid type: ${typeof response.data}`);
+                            console.warn(`Found ${type} cache blob ${mostRecent.pathname} but content was invalid type: ${typeof response.data}`);
                         }
                     }
                 } else {
-                    console.log(`No cache blob found: ${BLOB_CACHE_KEY}`);
+                    console.log(`No ${type} cache blob found: ${cacheKey}`);
                 }
             } catch (getError) {
                 if (getError.response && getError.response.status === 404) {
-                    console.log(`Cache blob ${BLOB_CACHE_KEY} not found, will initialize new cache.`);
+                    console.log(`Cache blob ${cacheKey} not found, will initialize new cache.`);
                 } else {
-                    console.error(`Error fetching cache blob ${BLOB_CACHE_KEY}:`, getError.message);
+                    console.error(`Error fetching ${type} cache blob ${cacheKey}:`, getError.message);
                 }
             }
 
             if (!loadedData) {
-                console.log("Initializing new empty cache (Blob).");
+                console.log(`Initializing new empty ${type} cache (Blob).`);
                 loadedData = emptyCache;
             }
         } catch (e) {
-            console.error("Error during Blob cache loading:", e.message);
+            console.error(`Error during ${type} Blob cache loading:`, e.message);
             loadedData = emptyCache;
         }
     } else { // Local Development
+        const localFile = type === 'main' ? LOCAL_CACHE_FILE : LOCAL_METADATA_FILE;
         try {
-            if (fs.existsSync(LOCAL_CACHE_FILE)) {
-                const fileData = fs.readFileSync(LOCAL_CACHE_FILE, 'utf8');
+            if (fs.existsSync(localFile)) {
+                const fileData = fs.readFileSync(localFile, 'utf8');
                 loadedData = JSON.parse(fileData);
-                console.log(`Loaded cache from local file: ${LOCAL_CACHE_FILE}`);
+                console.log(`Loaded ${type} cache from local file: ${localFile}`);
             } else {
-                console.log("Local cache file not found. Initializing empty cache.");
+                console.log(`Local ${type} cache file not found. Initializing empty cache.`);
                 loadedData = emptyCache;
             }
         } catch (e) {
-            console.error("Error loading cache from local file:", e.message);
+            console.error(`Error loading ${type} cache from local file:`, e.message);
             loadedData = emptyCache;
         }
     }
 
-    memoryCache = ensureCacheStructure(loadedData);
-    memoryCacheTimestamp = now;
-    return memoryCache;
+    const cache = ensureCacheStructure(loadedData, type);
+    if (type === 'main') {
+        memoryCache = cache;
+        memoryCacheTimestamp = now;
+    } else {
+        memoryMetadataCache = cache;
+        memoryMetadataTimestamp = now;
+    }
+    
+    return cache;
 };
 
-const saveCache = async (cache) => {
+const saveCache = async (cache, type = 'main') => {
     if (!cache || typeof cache !== 'object') {
-        console.error("Attempted to save invalid cache object.");
+        console.error(`Attempted to save invalid ${type} cache object.`);
         return;
     }
 
     // Ensure structure and update timestamp *before* saving
-    const cacheToSave = ensureCacheStructure({ ...cache });
+    const cacheToSave = ensureCacheStructure({ ...cache }, type);
     cacheToSave.timestamp = Date.now();
 
     // Update memory cache immediately with the latest data
-    memoryCache = cacheToSave;
-    memoryCacheTimestamp = cacheToSave.timestamp;
+    if (type === 'main') {
+        memoryCache = cacheToSave;
+        memoryCacheTimestamp = cacheToSave.timestamp;
+    } else {
+        memoryMetadataCache = cacheToSave;
+        memoryMetadataTimestamp = cacheToSave.timestamp;
+    }
 
-    const showCount = Object.keys(cacheToSave.shows).length;
-    const seasonCount = Object.keys(cacheToSave.seasons).length;
+    const count = type === 'main' 
+        ? Object.keys(cacheToSave.shows).length 
+        : Object.keys(cacheToSave.metadata).length;
 
     if (blob) { // Production with Vercel Blob
         try {
             // First, delete any existing cache files
+            const cacheKey = type === 'main' ? BLOB_CACHE_KEY : BLOB_METADATA_KEY;
             try {
-                const { blobs } = await blob.list({ prefix: 'mako-shows-cache-v1' });
+                const { blobs } = await blob.list({ prefix: cacheKey });
                 const deletePromises = blobs.map(oldBlob =>
                     blob.del(oldBlob.url)
-                        .then(() => console.log(`Deleted old cache file: ${oldBlob.pathname}`))
-                        .catch(delError => console.error(`Failed to delete old cache file ${oldBlob.pathname}:`, delError.message))
+                        .then(() => console.log(`Deleted old ${type} cache file: ${oldBlob.pathname}`))
+                        .catch(delError => console.error(`Failed to delete old ${type} cache file ${oldBlob.pathname}:`, delError.message))
                 );
                 await Promise.all(deletePromises);
             } catch (cleanupError) {
-                console.error("Failed during cache cleanup:", cleanupError.message);
+                console.error(`Failed during ${type} cache cleanup:`, cleanupError.message);
             }
 
             // Save the new cache file with a deterministic name
-            const putResult = await blob.put(BLOB_CACHE_KEY, JSON.stringify(cacheToSave), {
+            const putResult = await blob.put(cacheKey, JSON.stringify(cacheToSave), {
                 access: 'public',
                 contentType: 'application/json',
-                addRandomSuffix: false // Disable random suffix
+                addRandomSuffix: false
             });
-            console.log(`Cache saved successfully to Blob: ${putResult.pathname} (URL: ${putResult.url})`);
+            console.log(`${type} Cache saved successfully to Blob: ${putResult.pathname} (URL: ${putResult.url})`);
 
         } catch (e) {
-            console.error(`Error saving cache to Blob storage:`, e.message);
+            console.error(`Error saving ${type} cache to Blob storage:`, e.message);
             if (e.response) {
                 console.error(`Axios Error Details: Status=${e.response.status}`);
             }
         }
     } else { // Local Development
+        const localFile = type === 'main' ? LOCAL_CACHE_FILE : LOCAL_METADATA_FILE;
         try {
-            const cacheDir = path.dirname(LOCAL_CACHE_FILE);
+            const cacheDir = path.dirname(localFile);
             if (!fs.existsSync(cacheDir)) {
                 fs.mkdirSync(cacheDir, { recursive: true });
             }
-            fs.writeFileSync(LOCAL_CACHE_FILE, JSON.stringify(cacheToSave, null, 2), 'utf8');
-            console.log(`Cache saved locally (${showCount} shows, ${seasonCount} seasons) to ${LOCAL_CACHE_FILE}`);
+            fs.writeFileSync(localFile, JSON.stringify(cacheToSave, null, 2), 'utf8');
+            console.log(`${type} Cache saved locally (${count} items) to ${localFile}`);
         } catch (e) {
-            console.error("Error saving cache to local file:", e.message);
+            console.error(`Error saving ${type} cache to local file:`, e.message);
         }
     }
 };
@@ -909,89 +938,96 @@ const BATCH_SIZE = 10; // Number of shows to process in each batch
 let refreshInterval = null;
 
 // --- Background Refresh Functions ---
-const processShowBatch = async (shows, cache) => {
-    console.log(`Background: Starting batch of ${shows.length} shows`);
-    const batchPromises = shows.map(async (show) => {
-        try {
-            if (!show.url) {
-                console.warn('Background: Show missing URL, skipping');
-                return null;
+const processShowMetadata = async (showUrl) => {
+    try {
+        console.log(`Processing metadata for show: ${showUrl}`);
+        const details = await extractShowName(showUrl);
+        
+        if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
+            return {
+                name: details.name,
+                poster: details.poster,
+                background: details.background,
+                lastUpdated: Date.now()
+            };
+        }
+        return null;
+    } catch (err) {
+        console.error(`Error processing metadata for ${showUrl}:`, err.message);
+        return null;
+    }
+};
+
+const updateShowMetadata = async (shows) => {
+    console.log('Starting show metadata update...');
+    const metadataCache = await loadCache('metadata');
+    
+    // Process shows in batches
+    for (let i = 0; i < shows.length; i += BATCH_SIZE) {
+        const batch = shows.slice(i, i + BATCH_SIZE);
+        console.log(`Processing metadata batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(shows.length/BATCH_SIZE)}`);
+        
+        const batchPromises = batch.map(async (show) => {
+            if (!show.url) return;
+            
+            // Skip if we have fresh metadata
+            const existingMetadata = metadataCache.metadata[show.url];
+            if (existingMetadata && (Date.now() - existingMetadata.lastUpdated < CACHE_TTL_MS)) {
+                console.log(`Using cached metadata for ${show.url}`);
+                return;
             }
             
-            console.log(`Background: Processing show: ${show.url}`);
-            const details = await extractShowName(show.url);
-            
-            if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
-                if (!cache.shows) cache.shows = {};
-                cache.shows[show.url] = {
-                    name: details.name,
-                    poster: details.poster,
-                    background: details.background,
-                    lastUpdated: Date.now()
-                };
-                console.log(`Background: Successfully updated metadata for ${details.name}`);
-            } else {
-                console.warn(`Background: Invalid details for ${show.url}:`, details);
+            const metadata = await processShowMetadata(show.url);
+            if (metadata) {
+                metadataCache.metadata[show.url] = metadata;
             }
             await sleep(100); // Small delay between requests
-        } catch (err) {
-            console.error(`Background: Error processing show ${show.url}:`, err.message);
-        }
-    });
-
-    try {
+        });
+        
         await Promise.all(batchPromises);
-        console.log('Background: Batch completed successfully');
-    } catch (err) {
-        console.error('Background: Batch failed:', err);
+        await saveCache(metadataCache, 'metadata');
+        await sleep(1000); // Delay between batches
     }
+    
+    console.log('Completed show metadata update');
 };
 
 const backgroundRefresh = async () => {
     try {
-        console.log('Starting background refresh of show metadata...');
+        console.log('Starting background refresh...');
+        
+        // Get fresh show list
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
-        console.log(`Background: Found ${shows.length} shows to process`);
-
-        const cache = await loadCache();
-        if (!cache) {
-            console.error('Background: Failed to load cache');
-            return;
-        }
-
-        // Process shows in batches
-        for (let i = 0; i < shows.length; i += BATCH_SIZE) {
-            const batch = shows.slice(i, i + BATCH_SIZE);
-            console.log(`Background: Processing batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(shows.length/BATCH_SIZE)}`);
-            
-            try {
-                await processShowBatch(batch, cache);
-                
-                // Save cache after each batch
-                await saveCache(cache);
-                console.log(`Background: Saved cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
-                
-                await sleep(1000); // Delay between batches
-            } catch (batchError) {
-                console.error(`Background: Error in batch ${Math.floor(i/BATCH_SIZE) + 1}:`, batchError);
-                // Continue with next batch even if this one failed
-                continue;
-            }
-        }
-
-        console.log('Background: Completed refresh of show metadata');
+        console.log(`Found ${shows.length} shows to process`);
+        
+        // Update main cache with show list
+        const mainCache = await loadCache('main');
+        mainCache.shows = {};
+        shows.forEach(show => {
+            mainCache.shows[show.url] = {
+                url: show.url,
+                lastUpdated: Date.now()
+            };
+        });
+        await saveCache(mainCache, 'main');
+        
+        // Update show metadata
+        await updateShowMetadata(shows);
+        
+        console.log('Background refresh completed');
     } catch (err) {
-        console.error('Background: Error during refresh:', err);
+        console.error('Background refresh error:', err);
     }
 };
 
+// Start background refresh immediately and set up interval
 const startBackgroundRefresh = () => {
     if (refreshInterval) {
         clearInterval(refreshInterval);
     }
     
     // Run immediately on startup
-    backgroundRefresh().catch(err => console.error('Background: Initial refresh failed:', err));
+    backgroundRefresh().catch(err => console.error('Initial background refresh failed:', err));
     
     // Then set up interval
     refreshInterval = setInterval(backgroundRefresh, REFRESH_INTERVAL);
@@ -1180,15 +1216,8 @@ app.get('/meta/:type/:id.json', async (req, res) => {
                         // Cache the episodes
                         if (!cache.seasons) cache.seasons = {};
                         cache.seasons[cacheKey] = episodes;
-                        needsSave = true;
                     }
                     
-                    episodes.forEach((ep, i) => { 
-                        ep.seasonNum = seasonNum; 
-                        ep.episodeNum = i + 1; 
-                    });
-                    
-                    console.log(`Meta: Added ${episodes.length} episodes from season ${seasonNum}`);
                     return episodes;
                 });
                 
