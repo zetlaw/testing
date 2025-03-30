@@ -533,7 +533,7 @@ const getVideoUrl = async (episodeUrl) => {
 // Use manifest details from builder
 const builder = new addonBuilder({
     id: 'org.stremio.mako-vod',
-    version: '1.0.3', // Increment version
+    version: '1.0.3',
     name: 'Mako VOD',
     description: 'Watch VOD content from Mako (Israeli TV)',
     logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
@@ -547,6 +547,211 @@ const builder = new addonBuilder({
     }],
     behaviorHints: { adult: false, configurationRequired: false }
 });
+
+// Define handlers using the SDK
+builder.defineCatalogHandler(async ({ type, id, extra }) => {
+    try {
+        console.log('Processing catalog request:', { type, id, extra });
+        
+        if (type !== 'series' || id !== 'mako-vod-shows') {
+            console.log('Invalid catalog request, returning empty.');
+            return { metas: [] };
+        }
+
+        const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
+        const search = extra?.search?.toLowerCase() || '';
+        let filteredShows = shows;
+        
+        if (search) {
+            console.log(`Catalog: Searching for '${search}'`);
+            filteredShows = shows.filter(show => show.name && show.name.toLowerCase().includes(search));
+            console.log(`Catalog: Found ${filteredShows.length} matching search results`);
+        } else {
+            console.log(`Catalog: Returning full list (found ${shows.length} valid shows initially)`);
+        }
+
+        // Limit results significantly in production unless searching
+        const limit = process.env.NODE_ENV === 'production' && !search ? 50 : 200;
+        if (filteredShows.length > limit) {
+            console.log(`Catalog: Limiting results from ${filteredShows.length} to ${limit}`);
+            filteredShows = filteredShows.slice(0, limit);
+        }
+
+        const metas = filteredShows.map(show => ({
+            id: `mako:${encodeURIComponent(show.url)}`,
+            type: 'series',
+            name: show.name || 'Loading...',
+            poster: show.poster,
+            posterShape: 'poster',
+            background: show.background,
+            logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+            description: 'מאקו VOD',
+        }));
+
+        console.log(`Catalog: Responding with ${metas.length} metas.`);
+        return { metas };
+    } catch (err) {
+        console.error('Catalog handler error:', err);
+        return { metas: [] };
+    }
+});
+
+builder.defineMetaHandler(async ({ type, id }) => {
+    try {
+        console.log('Processing meta request:', { type, id });
+
+        if (type !== 'series' || !id.startsWith('mako:')) {
+            return { meta: null };
+        }
+
+        const showUrl = decodeURIComponent(id.replace('mako:', ''));
+        if (!showUrl.startsWith(BASE_URL)) {
+            console.error('Invalid show URL derived from meta ID:', showUrl);
+            return { meta: null };
+        }
+
+        const cache = await loadCache();
+        const cachedShowData = cache.shows ? cache.shows[showUrl] : null;
+        let showName = cachedShowData?.name;
+        let showPoster = cachedShowData?.poster;
+        let showBackground = cachedShowData?.background;
+        let needsSave = false;
+
+        const isCacheFresh = Date.now() - (cache.timestamp || 0) < CACHE_TTL;
+        if (!cachedShowData || !isCacheFresh) {
+            console.log(`Meta: Cache miss or stale for ${showUrl}, fetching details...`);
+            const showDetails = await extractShowName(showUrl);
+            showName = showDetails?.name && showDetails.name !== 'Unknown Show' && showDetails.name !== 'Error Loading' ? showDetails.name : (showName || 'Unknown Show');
+            showPoster = showDetails?.poster || showPoster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
+            showBackground = showDetails?.background || showBackground || showPoster;
+
+            if(showDetails && showDetails.name && showDetails.name !== 'Unknown Show' && showDetails.name !== 'Error Loading') {
+                if (!cache.shows) cache.shows = {};
+                if (!cache.shows[showUrl]) cache.shows[showUrl] = {};
+                cache.shows[showUrl] = {
+                    name: showName,
+                    poster: showPoster,
+                    background: showBackground,
+                    lastUpdated: Date.now()
+                };
+                needsSave = true;
+            } else {
+                console.warn(`Meta: Failed to fetch valid details for ${showUrl}, using placeholders/stale data.`);
+                showName = showName || 'Failed to Load';
+            }
+        } else {
+            showName = showName || 'Loading...';
+            showPoster = showPoster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
+            showBackground = showBackground || showPoster;
+        }
+
+        if(needsSave) saveCache(cache).catch(e => console.error("Async cache save failed:", e));
+
+        const seasons = await extractContent(showUrl, 'seasons');
+        let episodesToProcess = [];
+
+        if (!seasons || seasons.length === 0) {
+            episodesToProcess = await extractContent(showUrl, 'episodes');
+            if (episodesToProcess.length > 0) episodesToProcess.forEach((ep, i) => { ep.seasonNum = 1; ep.episodeNum = i + 1; });
+        } else {
+            const seasonLimit = process.env.NODE_ENV === 'production' ? 5 : 20;
+            const seasonsToFetch = seasons.slice(0, seasonLimit);
+            if (seasonsToFetch.length < seasons.length) console.warn(`Meta: Limiting season processing to first ${seasonLimit} seasons.`);
+
+            for (const season of seasonsToFetch) {
+                const episodes = await extractContent(season.url, 'episodes');
+                const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1');
+                episodes.forEach((ep, i) => { ep.seasonNum = seasonNum; ep.episodeNum = i + 1; episodesToProcess.push(ep); });
+                await sleep(50);
+            }
+        }
+
+        episodesToProcess.sort((a, b) => (a.seasonNum - b.seasonNum) || (a.episodeNum - b.episodeNum));
+        const videos = episodesToProcess.map(ep => ({
+            id: `${id}:ep:${ep.guid}`,
+            title: ep.name || `Episode ${ep.episodeNum}`,
+            season: ep.seasonNum,
+            episode: ep.episodeNum,
+            released: null
+        }));
+
+        return {
+            meta: {
+                id,
+                type: 'series',
+                name: showName,
+                poster: showPoster,
+                posterShape: 'poster',
+                background: showBackground,
+                logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+                description: 'מאקו VOD',
+                videos
+            }
+        };
+    } catch (err) {
+        console.error(`Meta handler error for ID ${id}:`, err);
+        return { meta: null };
+    }
+});
+
+builder.defineStreamHandler(async ({ type, id }) => {
+    try {
+        console.log('Processing stream request:', { type, id });
+
+        if (type !== 'series' || !id.startsWith('mako:')) {
+            return { streams: [] };
+        }
+
+        const [showIdRaw, episodeGuid] = id.split(':ep:');
+        if (!showIdRaw || !episodeGuid) {
+            return { streams: [] };
+        }
+
+        const showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
+        console.log(`Stream handler: Looking for GUID ${episodeGuid} within show ${showUrl}`);
+
+        let episodeUrl = null;
+        try {
+            console.log(`Stream: Re-fetching seasons/episodes for ${showUrl} to find URL for GUID ${episodeGuid}`);
+            const seasons = await extractContent(showUrl, 'seasons');
+            let episodesFound = [];
+            if (!seasons || seasons.length === 0) {
+                episodesFound = await extractContent(showUrl, 'episodes');
+            } else {
+                for (const season of seasons) {
+                    const episodes = await extractContent(season.url, 'episodes');
+                    episodesFound.push(...episodes);
+                    if (episodes.some(ep => ep.guid === episodeGuid)) break;
+                    await sleep(50);
+                }
+            }
+            const episode = episodesFound.find(ep => ep.guid === episodeGuid);
+            if (episode && episode.url) {
+                episodeUrl = episode.url;
+                console.log(`Stream handler: Found episode URL: ${episodeUrl}`);
+            } else {
+                console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
+                return { streams: [] };
+            }
+        } catch (error) {
+            console.error(`Stream handler: Error finding episode URL: ${error.message}`);
+            return { streams: [] };
+        }
+
+        const videoUrl = await getVideoUrl(episodeUrl);
+        if (!videoUrl) {
+            console.error(`Stream handler: getVideoUrl failed for ${episodeUrl}`);
+            return { streams: [] };
+        }
+        console.log(`Stream handler: Got video URL: ${videoUrl}`);
+
+        return { streams: [{ url: videoUrl, title: 'Play' }] };
+    } catch (err) {
+        console.error(`Stream handler error for ID ${id}:`, err);
+        return { streams: [] };
+    }
+});
+
 const addonInterface = builder.getInterface();
 
 // Create Express app
