@@ -972,9 +972,6 @@ app.use((req, res) => {
     res.status(404).json({ error: 'Not Found' });
 });
 
-// Start background refresh when the app starts
-startBackgroundRefresh();
-
 // Export the app for Vercel
 module.exports = app;
 
