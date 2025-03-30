@@ -1029,7 +1029,12 @@ const processShowMetadata = async (showUrl) => {
 
 const updateShowMetadata = async (shows) => {
     console.log('Starting show metadata update...');
-    const metadataCache = await loadCache('metadata');
+    let metadataCache = await loadCache('metadata');
+    
+    // Ensure metadata structure exists
+    if (!metadataCache.metadata) {
+        metadataCache.metadata = {};
+    }
     
     // Process shows in batches
     for (let i = 0; i < shows.length; i += BATCH_SIZE) {
@@ -1134,8 +1139,9 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 
         // Process shows using metadata cache
         const processedShows = filteredShows.map(show => {
-            const metadata = metadataCache.metadata[show.url];
-            if (metadata && isMetadataFresh) {
+            // If metadata cache is fresh, use it
+            if (isMetadataFresh && metadataCache.metadata && metadataCache.metadata[show.url]) {
+                const metadata = metadataCache.metadata[show.url];
                 console.log(`Using cached metadata for ${show.url}: ${metadata.name}`);
                 return {
                     ...show,
@@ -1144,9 +1150,16 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
                     background: metadata.background
                 };
             }
-            console.log(`No valid metadata for ${show.url}, skipping`);
-            return null;
-        }).filter(show => show !== null); // Remove shows without valid metadata
+            
+            // If no metadata or cache is stale, use basic show info
+            console.log(`Using basic show info for ${show.url}: ${show.name}`);
+            return {
+                ...show,
+                name: show.name || 'Loading...',
+                poster: show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+                background: show.background || show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg'
+            };
+        });
 
         // Create meta objects
         const metas = processedShows.map(show => ({
