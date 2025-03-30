@@ -851,9 +851,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             catch (e) { console.warn("Failed to parse search extra:", req.params.extra); }
         }
 
-        const result = await builder.getInterface().catalogs.find(cat => 
-            cat.type === type && cat.id === id
-        )?.handler({ type, id, extra });
+        const result = await builder.catalogHandler({ type, id, extra });
 
         if (!result) {
             return res.status(404).json({ metas: [], error: 'Catalog not found.' });
@@ -871,9 +869,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 app.get('/meta/:type/:id.json', async (req, res) => {
     try {
         const { type, id } = req.params;
-        const result = await builder.getInterface().meta.find(m => 
-            m.type === type
-        )?.handler({ type, id });
+        const result = await builder.metaHandler({ type, id });
 
         if (!result) {
             return res.status(404).json({ meta: null, error: 'Meta not found.' });
@@ -891,9 +887,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
 app.get('/stream/:type/:id.json', async (req, res) => {
     try {
         const { type, id } = req.params;
-        const result = await builder.getInterface().stream.find(s => 
-            s.type === type
-        )?.handler({ type, id });
+        const result = await builder.streamHandler({ type, id });
 
         if (!result) {
             return res.status(404).json({ streams: [], error: 'Stream not found.' });
