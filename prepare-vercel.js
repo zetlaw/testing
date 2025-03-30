@@ -67,6 +67,14 @@ async function preparePrecachedData() {
     
     // Calculate hash of the current metadata file
     const metadataContent = fs.readFileSync(sourceMetadataFile, 'utf8');
+    const metadataObj = JSON.parse(metadataContent);
+    const entryCount = Object.keys(metadataObj).length;
+
+    console.log(`Precached metadata has ${entryCount} entries`);
+    if (entryCount < 100) {
+        console.error('WARNING: Metadata file contains fewer than 100 entries. This is likely incomplete!');
+    }
+    
     const currentHash = crypto.createHash('md5').update(metadataContent).digest('hex');
     console.log(`Current metadata file hash: ${currentHash}`);
     
