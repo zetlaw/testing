@@ -20,6 +20,7 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 
 // Detect if we're running in a serverless environment
 const IS_SERVERLESS = process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.VERCEL || process.env.NETLIFY;
+const IS_VERCEL = process.env.VERCEL === '1';
 const WRITABLE_DIR = IS_SERVERLESS ? '/tmp' : __dirname;
 
 // --- Cache Paths ---
@@ -34,48 +35,23 @@ const MAX_BLOB_FILES_TO_KEEP = 2;
 let PRECACHED_DIR = path.join(__dirname, 'precached');
 let PRECACHED_METADATA_FILE = path.join(PRECACHED_DIR, 'metadata.json');
 
-// In serverless environments, try alternate paths if the file doesn't exist
-if (IS_SERVERLESS) {
-    // Log the environment for debugging
-    console.log(`Running in serverless environment. __dirname=${__dirname}`);
-    console.log(`Default precached path: ${PRECACHED_METADATA_FILE}`);
-    
-    // Try fallback paths for serverless environments
-    const fallbackPaths = [
-        path.join(process.cwd(), 'precached/metadata.json'),
-        '/tmp/precached/metadata.json',
-        path.join(__dirname, '../precached/metadata.json'),
-        path.join(__dirname, '../../precached/metadata.json')
-    ];
-    
-    if (!fs.existsSync(PRECACHED_METADATA_FILE)) {
-        console.log(`Primary precached metadata file not found, trying fallbacks...`);
-        for (const fallbackPath of fallbackPaths) {
-            if (fs.existsSync(fallbackPath)) {
-                console.log(`Found precached metadata at fallback path: ${fallbackPath}`);
-                PRECACHED_METADATA_FILE = fallbackPath;
-                PRECACHED_DIR = path.dirname(fallbackPath);
-                break;
-            } else {
-                console.log(`Fallback path not found: ${fallbackPath}`);
+// Setup blob client for Vercel
+let blobClient = null;
+if (IS_VERCEL) {
+    try {
+        const vercelBlob = require('@vercel/blob');
+        blobClient = {
+            list: vercelBlob.list,
+            get: async (url) => {
+                const response = await axios.get(url, { timeout: REQUEST_TIMEOUT_MS + 5000 });
+                return response.data;
             }
-        }
+        };
+        console.log("Successfully initialized @vercel/blob client");
+    } catch (e) {
+        console.error('Failed to initialize @vercel/blob:', e.message);
     }
 }
-
-// --- Headers ---
-const HEADERS = {
-    'User-Agent': USER_AGENT,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
-    'Referer': 'https://www.mako.co.il/mako-vod-index',
-    'Connection': 'keep-alive'
-};
-
-// --- Background Queue Configuration ---
-const QUEUE_BATCH_SIZE = 5;
-const QUEUE_DELAY_MS = 1000;
-const MAX_QUEUE_RETRIES = 3;
 
 // --- Metadata Processing Queue ---
 const metadataQueue = [];
@@ -96,107 +72,236 @@ try {
     // as we'll still have the pre-cached metadata in memory
 }
 
-// Load pre-cached metadata at startup
-try {
-    if (fs.existsSync(PRECACHED_METADATA_FILE)) {
-        console.log(`Loading pre-cached metadata from ${PRECACHED_METADATA_FILE}`);
-        const precachedData = JSON.parse(fs.readFileSync(PRECACHED_METADATA_FILE, 'utf8'));
-        
-        // Initialize the metadata cache with the precached data
-        globalMetadataCache = precachedData;
-        console.log(`Loaded ${Object.keys(globalMetadataCache).length} pre-cached metadata entries`);
-        
-        // If in serverless, copy precached data to /tmp for future invocations
-        if (IS_SERVERLESS) {
-            try {
-                const tmpDir = '/tmp/precached';
-                if (!fs.existsSync(tmpDir)) {
-                    fs.mkdirSync(tmpDir, { recursive: true });
+// Initialize metadata loading function
+async function initializeMetadataCache() {
+    // First try loading from Vercel Blob (preferred for serverless)
+    if (IS_VERCEL && blobClient) {
+        try {
+            console.log("Trying to load metadata from Vercel Blob storage...");
+            const { blobs } = await blobClient.list({ prefix: BLOB_METADATA_KEY_PREFIX });
+            
+            if (blobs && blobs.length > 0) {
+                const validBlobs = blobs.filter(b => b.uploadedAt);
+                if (validBlobs.length > 0) {
+                    // Sort by upload date (newest first)
+                    const sortedBlobs = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+                    const latestBlob = sortedBlobs[0];
+                    
+                    console.log(`Loading metadata from latest blob: ${latestBlob.url}`);
+                    const blobData = await blobClient.get(latestBlob.url);
+                    
+                    if (blobData && typeof blobData === 'object') {
+                        globalMetadataCache = blobData;
+                        console.log(`Successfully loaded ${Object.keys(globalMetadataCache).length} metadata entries from blob storage`);
+                        
+                        // Also save to tmp for faster access in future invocations
+                        try {
+                            fs.writeFileSync(LOCAL_METADATA_FILE, JSON.stringify(globalMetadataCache, null, 2));
+                            console.log(`Saved blob metadata to ${LOCAL_METADATA_FILE} for future invocations`);
+                        } catch (saveErr) {
+                            console.error(`Error saving blob metadata to tmp: ${saveErr.message}`);
+                        }
+                        
+                        return true;
+                    }
                 }
-                const tmpFile = path.join(tmpDir, 'metadata.json');
-                fs.writeFileSync(tmpFile, JSON.stringify(precachedData));
-                console.log(`Copied precached metadata to ${tmpFile} for future invocations`);
-            } catch (copyErr) {
-                console.error(`Failed to copy precached data to /tmp: ${copyErr.message}`);
             }
+            console.log("No valid metadata blobs found or blob was empty");
+        } catch (blobErr) {
+            console.error(`Error loading from blob storage: ${blobErr.message}`);
         }
-    } else {
-        console.log(`Pre-cached metadata file not found at ${PRECACHED_METADATA_FILE}`);
-        
-        // Try a direct HTTP fetch of the metadata if in serverless
-        if (IS_SERVERLESS) {
-            try {
-                console.log('Attempting to fetch precached metadata via HTTP');
-                const deploymentUrl = process.env.VERCEL_URL || '';
-                if (deploymentUrl) {
-                    const metadataUrl = `https://${deploymentUrl}/precached/metadata.json`;
-                    console.log(`Fetching from: ${metadataUrl}`);
+    }
+    
+    // Second, try to load from precached metadata file
+    try {
+        if (fs.existsSync(PRECACHED_METADATA_FILE)) {
+            console.log(`Loading pre-cached metadata from ${PRECACHED_METADATA_FILE}`);
+            const precachedData = JSON.parse(fs.readFileSync(PRECACHED_METADATA_FILE, 'utf8'));
+            
+            // Initialize the metadata cache with the precached data
+            globalMetadataCache = precachedData;
+            console.log(`Loaded ${Object.keys(globalMetadataCache).length} pre-cached metadata entries from file`);
+            
+            // If in serverless, copy to tmp for future invocations
+            if (IS_SERVERLESS) {
+                try {
+                    const tmpDir = path.join(WRITABLE_DIR, 'precached');
+                    if (!fs.existsSync(tmpDir)) {
+                        fs.mkdirSync(tmpDir, { recursive: true });
+                    }
+                    const tmpFile = path.join(tmpDir, 'metadata.json');
+                    fs.writeFileSync(tmpFile, JSON.stringify(precachedData));
+                    console.log(`Copied precached metadata to ${tmpFile} for future invocations`);
+                } catch (copyErr) {
+                    console.error(`Failed to copy precached data to tmp: ${copyErr.message}`);
+                }
+            }
+            
+            return true;
+        } else {
+            console.log(`Pre-cached metadata file not found at ${PRECACHED_METADATA_FILE}`);
+        }
+    } catch (fileErr) {
+        console.error(`Error loading from precached file: ${fileErr.message}`);
+    }
+    
+    // Third, if in Vercel, try direct HTTP fetch from the static precached URL
+    if (IS_VERCEL) {
+        try {
+            console.log('Attempting to fetch precached metadata via HTTP');
+            const deploymentUrl = process.env.VERCEL_URL || '';
+            if (deploymentUrl) {
+                const metadataUrl = `https://${deploymentUrl}/precached/metadata.json`;
+                console.log(`Fetching from: ${metadataUrl}`);
+                
+                try {
                     const response = await axios.get(metadataUrl, { timeout: 10000 });
                     if (response.data && typeof response.data === 'object') {
                         globalMetadataCache = response.data;
                         console.log(`Successfully fetched ${Object.keys(globalMetadataCache).length} metadata entries via HTTP`);
                         
                         // Save to tmp for future invocations
-                        const tmpDir = '/tmp/precached';
-                        if (!fs.existsSync(tmpDir)) {
-                            fs.mkdirSync(tmpDir, { recursive: true });
+                        try {
+                            fs.writeFileSync(LOCAL_METADATA_FILE, JSON.stringify(globalMetadataCache, null, 2));
+                            console.log(`Saved HTTP metadata to ${LOCAL_METADATA_FILE} for future invocations`);
+                        } catch (saveErr) {
+                            console.error(`Error saving HTTP metadata to tmp: ${saveErr.message}`);
                         }
-                        fs.writeFileSync(path.join(tmpDir, 'metadata.json'), JSON.stringify(globalMetadataCache));
+                        
+                        return true;
                     }
-                } else {
-                    console.log('No deployment URL found in environment variables');
+                } catch (httpErr) {
+                    console.error(`HTTP fetch of metadata failed: ${httpErr.message}`);
                 }
-            } catch (httpErr) {
-                console.error(`HTTP fetch of metadata failed: ${httpErr.message}`);
+            } else {
+                console.log('No deployment URL found in environment variables');
             }
+        } catch (httpErr) {
+            console.error(`Error with HTTP metadata fetch: ${httpErr.message}`);
         }
     }
     
-    // Load any additional locally cached metadata if it exists
-    if (fs.existsSync(LOCAL_METADATA_FILE)) {
-        console.log(`Loading local metadata cache from ${LOCAL_METADATA_FILE}`);
-        const localData = JSON.parse(fs.readFileSync(LOCAL_METADATA_FILE, 'utf8'));
-        
-        // Merge with priority to local cache (as it might be more recent)
-        Object.keys(localData).forEach(url => {
-            if (!globalMetadataCache[url] || 
-                (localData[url].lastUpdated && 
-                (!globalMetadataCache[url].lastUpdated || 
-                localData[url].lastUpdated > globalMetadataCache[url].lastUpdated))) {
-                globalMetadataCache[url] = localData[url];
+    // Finally, try to load from local cache in tmp directory
+    try {
+        if (fs.existsSync(LOCAL_METADATA_FILE)) {
+            console.log(`Loading local metadata cache from ${LOCAL_METADATA_FILE}`);
+            const localData = JSON.parse(fs.readFileSync(LOCAL_METADATA_FILE, 'utf8'));
+            
+            if (Object.keys(localData).length > 0) {
+                globalMetadataCache = localData;
+                console.log(`Loaded ${Object.keys(globalMetadataCache).length} entries from local cache`);
+                return true;
             }
-        });
-        
-        console.log(`Merged local metadata cache, now have ${Object.keys(globalMetadataCache).length} entries`);
+        }
+    } catch (localErr) {
+        console.error(`Error loading from local cache: ${localErr.message}`);
     }
-} catch (err) {
-    console.error(`Error loading cached metadata: ${err.message}`);
-    // Initialize with empty cache if loading fails
-    globalMetadataCache = {};
+    
+    console.warn('Failed to load metadata from any source, starting with empty cache');
+    return false;
 }
 
-// Set a timeout to handle serverless timeouts gracefully
-if (IS_SERVERLESS) {
-    // Most serverless platforms have a 10 second timeout
-    const SERVERLESS_TIMEOUT_MS = 9500; // Just under 10 seconds to be safe
+// Initialize metadata cache
+initializeMetadataCache().then(success => {
+    if (success) {
+        console.log('Metadata cache initialized successfully');
+    } else {
+        console.warn('Metadata cache initialization incomplete or failed');
+        globalMetadataCache = {};
+    }
     
-    setTimeout(() => {
-        console.log('Serverless timeout approaching, clearing queue and freeing resources');
-        // Clear the queue to prevent further processing
-        metadataQueue.length = 0;
-        isProcessingQueue = false;
+    // Set a timeout to handle serverless timeouts gracefully
+    if (IS_SERVERLESS) {
+        // Most serverless platforms have a 10 second timeout
+        const SERVERLESS_TIMEOUT_MS = 9500; // Just under 10 seconds to be safe
         
-        // Free memory in case we're approaching limits
-        if (Object.keys(globalMetadataCache).length > 200) {
-            console.log(`Trimming metadata cache from ${Object.keys(globalMetadataCache).length} to 200 entries`);
-            // Keep only the 200 most recently used entries
-            const entries = Object.entries(globalMetadataCache)
-                .sort((a, b) => (b[1].lastUpdated || 0) - (a[1].lastUpdated || 0))
-                .slice(0, 200);
+        setTimeout(() => {
+            console.log('Serverless timeout approaching, clearing queue and freeing resources');
+            // Clear the queue to prevent further processing
+            metadataQueue.length = 0;
+            isProcessingQueue = false;
             
-            globalMetadataCache = Object.fromEntries(entries);
+            // Free memory in case we're approaching limits
+            if (Object.keys(globalMetadataCache).length > 200) {
+                console.log(`Trimming metadata cache from ${Object.keys(globalMetadataCache).length} to 200 entries`);
+                // Keep only the 200 most recently used entries
+                const entries = Object.entries(globalMetadataCache)
+                    .sort((a, b) => (b[1].lastUpdated || 0) - (a[1].lastUpdated || 0))
+                    .slice(0, 200);
+                
+                globalMetadataCache = Object.fromEntries(entries);
+            }
+        }, SERVERLESS_TIMEOUT_MS);
+    }
+});
+
+// --- Headers ---
+const HEADERS = {
+    'User-Agent': USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
+    'Referer': 'https://www.mako.co.il/mako-vod-index',
+    'Connection': 'keep-alive'
+};
+
+// --- Background Queue Configuration ---
+const QUEUE_BATCH_SIZE = 5;
+const QUEUE_DELAY_MS = 1000;
+const MAX_QUEUE_RETRIES = 3;
+
+// --- Metadata Functions ---
+/**
+ * Get metadata for a show URL, using cache if available
+ * @param {string} url - The URL to get metadata for
+ * @param {number} maxAgeSec - Maximum age of cached metadata in seconds
+ * @returns {Promise<Object>} - The show metadata
+ */
+async function getMetadata(url, maxAgeSec = 86400) {
+    const maxAgeMs = maxAgeSec * 1000;
+    
+    // Check if metadata exists in cache and is fresh enough
+    if (globalMetadataCache[url] && 
+        globalMetadataCache[url].lastUpdated && 
+        Date.now() - globalMetadataCache[url].lastUpdated < maxAgeMs) {
+        console.log(`Metadata cache hit for ${url}`);
+        return globalMetadataCache[url];
+    }
+    
+    console.log(`Metadata cache miss or stale for ${url}`);
+    
+    // Try to get from cache even if stale, as a fallback
+    const cachedData = globalMetadataCache[url];
+    
+    // Queue for background refresh regardless of whether we have cached data
+    queueMetadataFetch(url, cachedData ? 1 : 2); // Prioritize if we have no cached data
+    
+    if (cachedData) {
+        return cachedData;
+    }
+    
+    // If no cached data, fetch directly (this will block the response)
+    try {
+        console.log(`Direct fetch for ${url} (blocking)`);
+        const metadata = await extractShowNameAndImages(url);
+        
+        // Store in cache
+        globalMetadataCache[url] = {
+            ...metadata,
+            lastUpdated: Date.now()
+        };
+        
+        // Save to cache file
+        try {
+            fs.writeFileSync(LOCAL_METADATA_FILE, JSON.stringify(globalMetadataCache, null, 2));
+        } catch (err) {
+            console.error(`Error saving metadata cache: ${err.message}`);
         }
-    }, SERVERLESS_TIMEOUT_MS);
+        
+        return metadata;
+    } catch (err) {
+        console.error(`Error fetching metadata for ${url}: ${err.message}`);
+        throw err;
+    }
 }
 
 // --- Queue Management Functions ---
@@ -322,61 +427,6 @@ async function processMetadataQueue() {
             
             setTimeout(processMetadataQueue, nextDelay);
         }
-    }
-}
-
-// --- Metadata Functions ---
-/**
- * Get metadata for a show URL, using cache if available
- * @param {string} url - The URL to get metadata for
- * @param {number} maxAgeSec - Maximum age of cached metadata in seconds
- * @returns {Promise<Object>} - The show metadata
- */
-async function getMetadata(url, maxAgeSec = 86400) {
-    const maxAgeMs = maxAgeSec * 1000;
-    
-    // Check if metadata exists in cache and is fresh enough
-    if (globalMetadataCache[url] && 
-        globalMetadataCache[url].lastUpdated && 
-        Date.now() - globalMetadataCache[url].lastUpdated < maxAgeMs) {
-        console.log(`Metadata cache hit for ${url}`);
-        return globalMetadataCache[url];
-    }
-    
-    console.log(`Metadata cache miss or stale for ${url}`);
-    
-    // Try to get from cache even if stale, as a fallback
-    const cachedData = globalMetadataCache[url];
-    
-    // Queue for background refresh regardless of whether we have cached data
-    queueMetadataFetch(url, cachedData ? 1 : 2); // Prioritize if we have no cached data
-    
-    if (cachedData) {
-        return cachedData;
-    }
-    
-    // If no cached data, fetch directly (this will block the response)
-    try {
-        console.log(`Direct fetch for ${url} (blocking)`);
-        const metadata = await extractShowNameAndImages(url);
-        
-        // Store in cache
-        globalMetadataCache[url] = {
-            ...metadata,
-            lastUpdated: Date.now()
-        };
-        
-        // Save to cache file
-        try {
-            fs.writeFileSync(LOCAL_METADATA_FILE, JSON.stringify(globalMetadataCache, null, 2));
-        } catch (err) {
-            console.error(`Error saving metadata cache: ${err.message}`);
-        }
-        
-        return metadata;
-    } catch (err) {
-        console.error(`Error fetching metadata for ${url}: ${err.message}`);
-        throw err;
     }
 }
 
@@ -1130,33 +1180,54 @@ builder.defineStreamHandler(async ({ type, id }) => {
             return { streams: [] };
         }
 
+        console.log(`Looking for episode with GUID: ${episodeGuid} from show: ${showUrl}`);
+        
         // Find target episode
         let targetEpisode = null;
-        const seasons = await extractContent(showUrl, 'seasons');
-        let allSeasons = seasons && seasons.length > 0 ? 
-            [{ name: "Season 1", url: showUrl }, ...seasons] :
-            [{ name: "Season 1", url: showUrl }];
         
+        // First get all seasons
+        const seasons = await extractContent(showUrl, 'seasons');
+        let allSeasons = [];
+        
+        if (seasons && seasons.length > 0) {
+            // Add main URL as Season 1
+            allSeasons = [
+                { name: "Season 1", url: showUrl },
+                ...seasons
+            ];
+        } else {
+            // No seasons found, just use the main URL
+            allSeasons = [{ name: "Season 1", url: showUrl }];
+        }
+        
+        // Search through each season for the episode
         for (const season of allSeasons) {
+            console.log(`Searching for episode in ${season.name}: ${season.url}`);
             const episodes = await extractContent(season.url, 'episodes');
+            
             if (episodes && episodes.length > 0) {
                 const found = episodes.find(ep => ep.guid === episodeGuid);
                 if (found) {
                     targetEpisode = found;
+                    console.log(`Found episode in ${season.name}: ${found.name}`);
                     break;
                 }
             }
+            
+            // Don't sleep after the last season
             if (season !== allSeasons[allSeasons.length - 1]) {
                 await sleep(200);
             }
         }
 
         if (!targetEpisode || !targetEpisode.url) {
+            console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
             return { streams: [] };
         }
 
         const videoUrl = await getVideoUrl(targetEpisode.url);
         if (!videoUrl) {
+            console.error(`Stream handler: getVideoUrl failed for ${targetEpisode.url}`);
             return { streams: [] };
         }
 
