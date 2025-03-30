@@ -1,25 +1,27 @@
 // index.js
+const express = require('express');
+const cors = require('cors');
 const { addonBuilder } = require('stremio-addon-sdk');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const fs = require('fs');
 const path = require('path');
-const express = require('express');
-const cors = require('cors');
+const fs = require('fs');
 const { CRYPTO, cryptoOp } = require('./crypto');
 
 // --- Constants ---
-const BASE_URL = "https://www.mako.co.il";
-const DEFAULT_LOGO = 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
+const BASE_URL = 'https://www.mako.co.il';
+const DEFAULT_LOGO = 'https://img.mako.co.il/2016/02/17/logo12plus_i.jpg';
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const DELAY_BETWEEN_REQUESTS_MS = 500;
 const REQUEST_TIMEOUT_MS = 10000;
 const EPISODE_FETCH_TIMEOUT_MS = 20000;
 const BATCH_SIZE = 5;
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 // --- Cache Paths ---
 const LOCAL_CACHE_DIR = path.join(__dirname, '.cache');
-const LOCAL_METADATA_FILE = path.join(LOCAL_CACHE_DIR, "mako_shows_metadata.json");
+const LOCAL_CACHE_FILE = path.join(LOCAL_CACHE_DIR, 'shows.json');
+const LOCAL_METADATA_FILE = path.join(LOCAL_CACHE_DIR, "metadata.json");
 const BLOB_METADATA_KEY_PREFIX = 'mako-shows-metadata-v1';
 const MAX_BLOB_FILES_TO_KEEP = 2;
 
@@ -27,173 +29,221 @@ const MAX_BLOB_FILES_TO_KEEP = 2;
 const PRECACHED_DIR = path.join(__dirname, 'precached');
 const PRECACHED_METADATA_FILE = path.join(PRECACHED_DIR, 'metadata.json');
 
-// --- Headers ---
-const HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
-    'Referer': `${BASE_URL}/mako-vod-index`,
-    'Connection': 'keep-alive'
-};
+// --- Background Queue Configuration ---
+const QUEUE_BATCH_SIZE = 5;
+const QUEUE_DELAY_MS = 1000;
+const MAX_QUEUE_RETRIES = 3;
 
-// --- Environment Setup ---
-console.log(`Current NODE_ENV: ${process.env.NODE_ENV}`);
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// --- Metadata Processing Queue ---
+const metadataQueue = [];
+let isProcessingQueue = false;
+let lastQueueProcess = 0;
+let globalMetadataCache = {};
 
-// --- Vercel Blob Setup ---
-let blob;
-if (IS_PRODUCTION) {
-    try {
-        const vercelBlob = require('@vercel/blob');
-        blob = {
-            put: vercelBlob.put,
-            list: vercelBlob.list,
-            del: vercelBlob.del
-        };
-        console.log("Successfully required @vercel/blob package.");
-    } catch (e) {
-        console.error('Failed to load @vercel/blob, cache will not persist:', e.message);
-        blob = null;
-    }
-} else {
-    console.log("Not in production, Vercel Blob will not be used.");
-    blob = null;
+// --- Initialize ---
+// Create cache directory if it doesn't exist
+if (!fs.existsSync(LOCAL_CACHE_DIR)) {
+    console.log(`Creating cache directory: ${LOCAL_CACHE_DIR}`);
+    fs.mkdirSync(LOCAL_CACHE_DIR, { recursive: true });
 }
 
-// --- Cache Management ---
-const ensureCacheStructure = (cacheData) => {
-    const emptyMetadata = { timestamp: 0, metadata: {}, seasons: {}, shows: {} };
-
-    if (typeof cacheData !== 'object' || cacheData === null) {
-        return emptyMetadata;
-    }
-
-    cacheData.metadata = cacheData.metadata || {};
-    cacheData.seasons = cacheData.seasons || {};
-    cacheData.shows = cacheData.shows || {};
-    cacheData.timestamp = cacheData.timestamp || 0;
-    return cacheData;
-};
-
-const loadCache = async () => {
-    const now = Date.now();
-    const emptyCache = ensureCacheStructure(null);
-    const cacheKeyPrefix = BLOB_METADATA_KEY_PREFIX;
-    const localFile = LOCAL_METADATA_FILE;
-    const precachedFile = PRECACHED_METADATA_FILE;
-
-    // First try to load from Vercel Blob
-    if (blob) {
-        try {
-            let mostRecent = null;
-            try {
-                const { blobs } = await blob.list({ prefix: cacheKeyPrefix });
-                if (blobs?.length > 0) {
-                    const validBlobs = blobs.filter(b => b.uploadedAt);
-                    if (validBlobs.length > 0) {
-                        mostRecent = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))[0];
-                        if (mostRecent.size > 0) {
-                            const response = await axios.get(mostRecent.url, { timeout: REQUEST_TIMEOUT_MS + 5000 });
-                            if (typeof response.data === 'object' && response.data !== null) {
-                                return ensureCacheStructure(response.data);
-                            }
-                        }
-                    }
-                }
-            } catch (listOrGetError) {
-                console.error(`Error with blob:`, listOrGetError.message);
-            }
-        } catch (e) {
-            console.error(`Error loading cache:`, e.message);
-        }
-    }
-
-    // Then try to load from local cache
-    try {
-        const cacheDir = path.dirname(localFile);
-        if (!fs.existsSync(cacheDir)) {
-            fs.mkdirSync(cacheDir, { recursive: true });
-        }
-        if (fs.existsSync(localFile)) {
-            return ensureCacheStructure(JSON.parse(fs.readFileSync(localFile, 'utf8')));
-        }
-    } catch (e) {
-        console.error(`Error loading cache from local file:`, e.message);
-    }
-
-    // Finally try to load from precached data
-    try {
-        if (fs.existsSync(precachedFile)) {
-            console.log(`Loading precached data from: ${precachedFile}`);
-            const precached = JSON.parse(fs.readFileSync(precachedFile, 'utf8'));
-            const cache = ensureCacheStructure(precached);
-            
-            // We need to set the lastUpdated property if missing
-            if (cache.metadata) {
-                const now = Date.now();
-                Object.keys(cache.metadata).forEach(key => {
-                    if (!cache.metadata[key].lastUpdated) {
-                        cache.metadata[key].lastUpdated = now;
-                    }
-                });
-            }
-            
-            return cache;
-        }
-    } catch (e) {
-        console.error(`Error loading cache from precached file:`, e.message);
+// Load pre-cached metadata at startup
+try {
+    if (fs.existsSync(PRECACHED_METADATA_FILE)) {
+        console.log(`Loading pre-cached metadata from ${PRECACHED_METADATA_FILE}`);
+        const precachedData = JSON.parse(fs.readFileSync(PRECACHED_METADATA_FILE, 'utf8'));
+        
+        // Initialize the metadata cache with the precached data
+        globalMetadataCache = precachedData;
+        console.log(`Loaded ${Object.keys(globalMetadataCache).length} pre-cached metadata entries`);
+    } else {
+        console.log(`Pre-cached metadata file not found at ${PRECACHED_METADATA_FILE}`);
     }
     
-    return emptyCache;
-};
+    // Load any additional locally cached metadata if it exists
+    if (fs.existsSync(LOCAL_METADATA_FILE)) {
+        console.log(`Loading local metadata cache from ${LOCAL_METADATA_FILE}`);
+        const localData = JSON.parse(fs.readFileSync(LOCAL_METADATA_FILE, 'utf8'));
+        
+        // Merge with priority to local cache (as it might be more recent)
+        Object.keys(localData).forEach(url => {
+            if (!globalMetadataCache[url] || 
+                (localData[url].lastUpdated && 
+                (!globalMetadataCache[url].lastUpdated || 
+                localData[url].lastUpdated > globalMetadataCache[url].lastUpdated))) {
+                globalMetadataCache[url] = localData[url];
+            }
+        });
+        
+        console.log(`Merged local metadata cache, now have ${Object.keys(globalMetadataCache).length} entries`);
+    }
+} catch (err) {
+    console.error(`Error loading cached metadata: ${err.message}`);
+}
 
-const saveCache = async (cache) => {
-    if (!cache || typeof cache !== 'object') {
-        console.error(`Attempted to save invalid cache object.`);
+// --- Queue Management Functions ---
+/**
+ * Add a URL to the metadata fetch queue
+ * @param {string} url - The URL to fetch metadata for
+ * @param {number} priority - Priority level (higher = more important)
+ */
+function queueMetadataFetch(url, priority = 0) {
+    // Don't add duplicates to the queue
+    const existingIndex = metadataQueue.findIndex(item => item.url === url);
+    
+    if (existingIndex >= 0) {
+        // Update priority if new priority is higher
+        if (priority > metadataQueue[existingIndex].priority) {
+            metadataQueue[existingIndex].priority = priority;
+            // Re-sort queue by priority (higher first)
+            metadataQueue.sort((a, b) => b.priority - a.priority);
+        }
         return;
     }
+    
+    // Add to queue
+    metadataQueue.push({ url, priority, retries: 0 });
+    
+    // Sort by priority
+    metadataQueue.sort((a, b) => b.priority - a.priority);
+    
+    // Start processing queue if not already running
+    if (!isProcessingQueue) {
+        processMetadataQueue();
+    }
+}
 
-    const cacheToSave = ensureCacheStructure({ ...cache });
-    cacheToSave.timestamp = Date.now();
-    const count = Object.keys(cacheToSave.metadata).length;
-    const cacheKeyPrefix = BLOB_METADATA_KEY_PREFIX;
-    const localFile = LOCAL_METADATA_FILE;
-
-    if (blob) {
-        try {
-            const uniquePathname = `${cacheKeyPrefix}-${cacheToSave.timestamp}-${Math.random().toString(36).substring(2, 10)}.json`;
-            await blob.put(uniquePathname, JSON.stringify(cacheToSave), {
-                access: 'public',
-                contentType: 'application/json'
-            });
-
-            // Cleanup old files
+/**
+ * Process items in the metadata queue
+ */
+async function processMetadataQueue() {
+    if (isProcessingQueue || metadataQueue.length === 0) return;
+    
+    isProcessingQueue = true;
+    console.log(`Processing metadata queue (${metadataQueue.length} items remaining)`);
+    
+    // Throttle queue processing
+    const now = Date.now();
+    if (now - lastQueueProcess < QUEUE_DELAY_MS) {
+        await new Promise(resolve => setTimeout(resolve, QUEUE_DELAY_MS));
+    }
+    lastQueueProcess = Date.now();
+    
+    try {
+        // Process a batch of items
+        const batch = metadataQueue.slice(0, QUEUE_BATCH_SIZE);
+        const promises = batch.map(async (item) => {
             try {
-                const { blobs } = await blob.list({ prefix: cacheKeyPrefix });
-                const validBlobs = blobs.filter(b => b.uploadedAt);
-                if (validBlobs.length > MAX_BLOB_FILES_TO_KEEP) {
-                    const sortedBlobs = validBlobs.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
-                    const blobsToDelete = sortedBlobs.slice(MAX_BLOB_FILES_TO_KEEP);
-                    await Promise.all(blobsToDelete.map(oldBlob => blob.del(oldBlob.url)));
+                console.log(`Fetching metadata for ${item.url} (background)`);
+                const metadata = await extractShowNameAndImages(item.url);
+                
+                // Store in cache
+                globalMetadataCache[item.url] = {
+                    ...metadata,
+                    lastUpdated: Date.now()
+                };
+                
+                // Remove from queue
+                const index = metadataQueue.findIndex(i => i.url === item.url);
+                if (index >= 0) metadataQueue.splice(index, 1);
+                
+                console.log(`Successfully fetched metadata for: ${metadata.name} [Source: ${metadata.nameSource}]`);
+                return { success: true, url: item.url };
+            } catch (err) {
+                console.error(`Error fetching metadata for ${item.url}: ${err.message}`);
+                
+                // Handle retries
+                const index = metadataQueue.findIndex(i => i.url === item.url);
+                if (index >= 0) {
+                    if (metadataQueue[index].retries < MAX_QUEUE_RETRIES) {
+                        metadataQueue[index].retries++;
+                        // Move to the end of the queue for retry
+                        const item = metadataQueue.splice(index, 1)[0];
+                        metadataQueue.push(item);
+                    } else {
+                        // Give up after max retries
+                        console.log(`Giving up on ${item.url} after ${MAX_QUEUE_RETRIES} retries`);
+                        metadataQueue.splice(index, 1);
+                    }
                 }
-            } catch (cleanupError) {
-                console.error(`Failed during cache cleanup:`, cleanupError.message);
+                
+                return { success: false, url: item.url, error: err.message };
             }
-        } catch (e) {
-            console.error(`Error saving cache to Blob:`, e.message);
-        }
-    } else {
+        });
+        
+        await Promise.all(promises);
+        
+        // Save updated metadata to cache file
         try {
-            const cacheDir = path.dirname(localFile);
-            if (!fs.existsSync(cacheDir)) {
-                fs.mkdirSync(cacheDir, { recursive: true });
-            }
-            fs.writeFileSync(localFile, JSON.stringify(cacheToSave, null, 2), 'utf8');
-        } catch (e) {
-            console.error(`Error saving cache to local file:`, e.message);
+            fs.writeFileSync(LOCAL_METADATA_FILE, JSON.stringify(globalMetadataCache, null, 2));
+        } catch (err) {
+            console.error(`Error saving metadata cache: ${err.message}`);
+        }
+        
+    } finally {
+        isProcessingQueue = false;
+        
+        // If there are more items, continue processing after a delay
+        if (metadataQueue.length > 0) {
+            setTimeout(processMetadataQueue, QUEUE_DELAY_MS);
         }
     }
-};
+}
+
+// --- Metadata Functions ---
+/**
+ * Get metadata for a show URL, using cache if available
+ * @param {string} url - The URL to get metadata for
+ * @param {number} maxAgeSec - Maximum age of cached metadata in seconds
+ * @returns {Promise<Object>} - The show metadata
+ */
+async function getMetadata(url, maxAgeSec = 86400) {
+    const maxAgeMs = maxAgeSec * 1000;
+    
+    // Check if metadata exists in cache and is fresh enough
+    if (globalMetadataCache[url] && 
+        globalMetadataCache[url].lastUpdated && 
+        Date.now() - globalMetadataCache[url].lastUpdated < maxAgeMs) {
+        console.log(`Metadata cache hit for ${url}`);
+        return globalMetadataCache[url];
+    }
+    
+    console.log(`Metadata cache miss or stale for ${url}`);
+    
+    // Try to get from cache even if stale, as a fallback
+    const cachedData = globalMetadataCache[url];
+    
+    // Queue for background refresh regardless of whether we have cached data
+    queueMetadataFetch(url, cachedData ? 1 : 2); // Prioritize if we have no cached data
+    
+    if (cachedData) {
+        return cachedData;
+    }
+    
+    // If no cached data, fetch directly (this will block the response)
+    try {
+        console.log(`Direct fetch for ${url} (blocking)`);
+        const metadata = await extractShowNameAndImages(url);
+        
+        // Store in cache
+        globalMetadataCache[url] = {
+            ...metadata,
+            lastUpdated: Date.now()
+        };
+        
+        // Save to cache file
+        try {
+            fs.writeFileSync(LOCAL_METADATA_FILE, JSON.stringify(globalMetadataCache, null, 2));
+        } catch (err) {
+            console.error(`Error saving metadata cache: ${err.message}`);
+        }
+        
+        return metadata;
+    } catch (err) {
+        console.error(`Error fetching metadata for ${url}: ${err.message}`);
+        throw err;
+    }
+}
 
 // --- Helper Functions ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -739,7 +789,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             catch (e) { console.warn("Failed to parse search extra:", req.params.extra); }
         }
 
-        // Directly call the same implementation as in the defineCatalogHandler
+        // Handle catalog request
         if (type !== 'series' || id !== 'mako-vod-shows') {
             return res.status(404).json({ metas: [], error: 'Catalog not found.' });
         }
@@ -749,28 +799,38 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             searchTerm = extra.search;
         }
 
-        const metadataCache = await loadCache();
-        
         // Check if we already have shows in the cache before trying to fetch
         let initialShows = [];
-        if (metadataCache.shows && Object.keys(metadataCache.shows).length > 0) {
-            console.log(`Using ${Object.keys(metadataCache.shows).length} shows from cache`);
-            initialShows = Object.entries(metadataCache.shows).map(([url, data]) => ({
-                url,
-                name: data.name,
-                poster: data.poster
-            }));
+        if (fs.existsSync(LOCAL_CACHE_FILE)) {
+            console.log(`Loading shows from cache ${LOCAL_CACHE_FILE}`);
+            initialShows = JSON.parse(fs.readFileSync(LOCAL_CACHE_FILE, 'utf8'));
         } else {
             // Only fetch shows if not in cache
             initialShows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
             console.log(`Catalog: Extracted ${initialShows.length} initial show links.`);
+            
+            // Save to cache
+            fs.writeFileSync(LOCAL_CACHE_FILE, JSON.stringify(initialShows, null, 2));
         }
 
         let filteredShows = initialShows;
         if (searchTerm) {
             const search = searchTerm.toLowerCase();
-            filteredShows = initialShows.filter(show => show.name && show.name.toLowerCase().includes(search));
-            console.log(`Catalog: Found ${filteredShows.length} shows matching initial name search: ${search}`);
+            filteredShows = initialShows.filter(show => {
+                // Try to match by name first
+                if (show.name && show.name.toLowerCase().includes(search)) {
+                    return true;
+                }
+                
+                // If we have metadata, try to match with that too
+                const metadata = globalMetadataCache[show.url];
+                if (metadata && metadata.name && metadata.name.toLowerCase().includes(search)) {
+                    return true;
+                }
+                
+                return false;
+            });
+            console.log(`Catalog: Found ${filteredShows.length} shows matching search: ${search}`);
         }
 
         const metas = [];
@@ -779,30 +839,34 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             const batchPromises = batch.map(async (show) => {
                 if (!show.url) return null;
 
-                let showDetails = metadataCache.metadata?.[show.url];
-                if (!showDetails || Date.now() - (showDetails.lastUpdated || 0) > CACHE_TTL_MS) {
-                    // Only fetch metadata if not in cache or stale
-                    console.log(`Catalog: Fetching metadata for ${show.url}`);
-                    const { details } = await getOrUpdateShowMetadata(show.url, metadataCache);
-                    showDetails = details;
-                    metadataCache.metadata[show.url] = { ...details, lastUpdated: Date.now() };
-                    metadataCache.shows[show.url] = { name: details.name, poster: details.poster };
+                // Prioritize metadata fetching for current batch
+                queueMetadataFetch(show.url, 2);  // High priority for visible items
+                
+                try {
+                    // Get metadata (will use cache if available)
+                    const metadata = await getMetadata(show.url);
+                    
+                    return {
+                        id: `mako:${encodeURIComponent(show.url)}`,
+                        type: 'series',
+                        name: metadata.name || show.name || 'Loading...',
+                        poster: metadata.poster || show.poster || DEFAULT_LOGO,
+                        posterShape: 'poster',
+                        background: metadata.background || metadata.poster || show.poster || DEFAULT_LOGO,
+                        logo: DEFAULT_LOGO,
+                        description: metadata.description || 'מאקו VOD',
+                    };
+                } catch (error) {
+                    console.error(`Error creating meta for ${show.url}: ${error.message}`);
+                    return {
+                        id: `mako:${encodeURIComponent(show.url)}`,
+                        type: 'series',
+                        name: show.name || 'Unknown Show',
+                        poster: show.poster || DEFAULT_LOGO,
+                        posterShape: 'poster',
+                        logo: DEFAULT_LOGO,
+                    };
                 }
-
-                if (searchTerm && showDetails.name && !showDetails.name.toLowerCase().includes(searchTerm.toLowerCase())) {
-                    return null;
-                }
-
-                return {
-                    id: `mako:${encodeURIComponent(show.url)}`,
-                    type: 'series',
-                    name: showDetails.name || show.name || 'Loading...',
-                    poster: showDetails.poster || show.poster || DEFAULT_LOGO,
-                    posterShape: 'poster',
-                    background: showDetails.background || showDetails.poster || show.poster || DEFAULT_LOGO,
-                    logo: DEFAULT_LOGO,
-                    description: showDetails.description || 'מאקו VOD',
-                };
             });
 
             const batchResults = await Promise.all(batchPromises);
@@ -818,8 +882,14 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
                 await sleep(100);
             }
         }
-
-        await saveCache(metadataCache);
+        
+        // Queue background fetching for all non-visible shows
+        const visibleUrls = new Set(metas.map(meta => decodeURIComponent(meta.id.replace('mako:', ''))));
+        filteredShows.forEach(show => {
+            if (show.url && !visibleUrls.has(show.url)) {
+                queueMetadataFetch(show.url, 0);  // Low priority for non-visible items
+            }
+        });
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300');

@@ -11,6 +11,8 @@ const DEFAULT_LOGO = 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
 const DELAY_BETWEEN_REQUESTS_MS = 500;
 const REQUEST_TIMEOUT_MS = 10000;
 const BATCH_SIZE = 20;
+const PRECACHED_DIR = 'precached';
+const PRECACHED_METADATA_FILE = `${PRECACHED_DIR}/metadata.json`;
 
 // --- Output Files ---
 const OUTPUT_DIR = path.join(__dirname, 'precached');
@@ -324,95 +326,97 @@ const extractContent = async (url, contentType) => {
 
 // --- Main Function ---
 async function main() {
-    console.log("Starting metadata download process...");
+    console.log('Starting metadata download process...');
     
-    // Create output directory if it doesn't exist
-    if (!fs.existsSync(OUTPUT_DIR)) {
-        fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-    }
-    
-    // Step 1: Get all shows
-    console.log("Fetching show list from index page...");
-    const initialShows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
-    console.log(`Found ${initialShows.length} shows.`);
-    
-    // Step 2: Get metadata for each show
-    console.log("Fetching metadata for each show...");
-    const metadataCache = {
-        timestamp: Date.now(),
-        metadata: {},
-        seasons: {},
-        shows: {},  // Include shows data within the metadata file
-        stats: {
-            jsonld: 0,
-            html: 0,
-            error: 0,
-            unknown: 0
+    try {
+        // Create the precached directory if it doesn't exist
+        if (!fs.existsSync(PRECACHED_DIR)) {
+            fs.mkdirSync(PRECACHED_DIR, { recursive: true });
         }
-    };
-    
-    let completedShows = 0;
-    const totalShows = initialShows.length;
-    
-    for (let i = 0; i < initialShows.length; i += BATCH_SIZE) {
-        const batch = initialShows.slice(i, i + BATCH_SIZE);
-        const batchPromises = batch.map(async (show) => {
-            if (!show.url) return null;
+        
+        // Fetch the show list
+        console.log('Fetching show list from index page...');
+        const showList = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
+        console.log(`Found ${showList.length} shows.`);
+        
+        // Metadata cache - the complete precached data
+        const metadata = {};
+        let completedShows = 0;
+        let nameSourceStats = {
+            'json-ld': 0,
+            'html': 0,
+            'error': 0,
+            'unknown': 0
+        };
+        
+        // Fetch metadata for each show
+        console.log('Fetching metadata for each show...');
+        
+        // Process shows in batches to avoid memory issues
+        const batchSize = 20;
+        for (let i = 0; i < showList.length; i += batchSize) {
+            const batch = showList.slice(i, i + batchSize);
+            console.log(`Fetching metadata for batch ${i+1}-${Math.min(i+batchSize, showList.length)}/${showList.length}`);
             
-            console.log(`Fetching metadata for ${show.url} (${i+1}-${Math.min(i+BATCH_SIZE, totalShows)}/${totalShows})`);
-            const details = await extractShowNameAndImages(show.url);
-            
-            if (details.name !== 'Error Loading Show' && details.name !== 'Unknown Show') {
-                // Track name source stats
-                if (details.nameSource) {
-                    metadataCache.stats[details.nameSource] = (metadataCache.stats[details.nameSource] || 0) + 1;
+            // Create promise for each show in the batch
+            const promises = batch.map(async (show, index) => {
+                // Use the show's URL property, not the show object itself
+                const url = show.url;
+                console.log(`Fetching metadata for ${url} (${i+index+1}-${Math.min(i+batchSize, showList.length)}/${showList.length})`);
+                try {
+                    const showMetadata = await extractShowNameAndImages(url);
+                    
+                    // Add to statistics
+                    if (showMetadata.nameSource) {
+                        nameSourceStats[showMetadata.nameSource] = (nameSourceStats[showMetadata.nameSource] || 0) + 1;
+                    } else {
+                        nameSourceStats['unknown'] = (nameSourceStats['unknown'] || 0) + 1;
+                    }
+                    
+                    // Store in metadata object with URL as key
+                    metadata[url] = {
+                        ...showMetadata,
+                        lastUpdated: Date.now()
+                    };
+                    
+                    completedShows++;
+                    console.log(`✓ Successfully fetched metadata for: ${showMetadata.name} [Source: ${showMetadata.nameSource}]`);
+                    return showMetadata;
+                } catch (error) {
+                    console.error(`Failed to fetch metadata for ${url}:`, error.message);
+                    nameSourceStats['error'] = (nameSourceStats['error'] || 0) + 1;
+                    return null;
                 }
-                
-                // Store full metadata
-                metadataCache.metadata[show.url] = {
-                    ...details,
-                    lastUpdated: Date.now()
-                };
-                
-                // Also store basic info in shows section for backward compatibility
-                metadataCache.shows[show.url] = { 
-                    name: details.name, 
-                    poster: details.poster 
-                };
-                
-                console.log(`✓ Successfully fetched metadata for: ${details.name} [Source: ${details.nameSource}]`);
-                return true;
-            } else {
-                metadataCache.stats.error = (metadataCache.stats.error || 0) + 1;
-                console.warn(`✗ Failed to fetch metadata for: ${show.url}`);
-                return false;
+            });
+            
+            // Wait for all promises in the batch
+            await Promise.all(promises);
+            
+            // Log progress after each batch
+            console.log(`Progress: ${Math.min(i + batchSize, showList.length)}/${showList.length} (${Math.floor((Math.min(i + batchSize, showList.length) / showList.length) * 100)}%)`);
+            console.log(`Name sources so far: JSON-LD: ${nameSourceStats['json-ld']}, HTML: ${nameSourceStats['html']}, Errors: ${nameSourceStats['error']}, Unknown: ${nameSourceStats['unknown']}`);
+            
+            // Save progress after each batch
+            fs.writeFileSync(PRECACHED_METADATA_FILE, JSON.stringify(metadata, null, 2));
+            
+            // Wait a bit before the next batch to avoid rate limiting
+            if (i + batchSize < showList.length) {
+                console.log('Waiting before next batch...');
+                await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS_MS));
             }
-        });
-        
-        const batchResults = await Promise.all(batchPromises);
-        completedShows += batchResults.filter(Boolean).length;
-        
-        // Save progress after each batch
-        fs.writeFileSync(METADATA_FILE, JSON.stringify(metadataCache, null, 2), 'utf8');
-        console.log(`Progress: ${completedShows}/${totalShows} (${Math.round(completedShows/totalShows*100)}%)`);
-        console.log(`Name sources so far: JSON-LD: ${metadataCache.stats.jsonld}, HTML: ${metadataCache.stats.html}, Errors: ${metadataCache.stats.error}, Unknown: ${metadataCache.stats.unknown}`);
-        
-        if (i + BATCH_SIZE < initialShows.length) {
-            // Add a delay between batches to avoid hammering the server
-            console.log("Waiting before next batch...");
-            await sleep(1000);
         }
+        
+        console.log('\nDownload complete! Metadata saved for', completedShows + '/' + showList.length, 'shows.');
+        console.log('Name extraction statistics:');
+        console.log(`- JSON-LD: ${nameSourceStats['json-ld']} (${Math.floor((nameSourceStats['json-ld'] / showList.length) * 100)}%)`);
+        console.log(`- HTML fallback: ${nameSourceStats['html']} (${Math.floor((nameSourceStats['html'] / showList.length) * 100)}%)`);
+        console.log(`- Errors: ${nameSourceStats['error']} (${Math.floor((nameSourceStats['error'] / showList.length) * 100)}%)`);
+        console.log(`- Unknown: ${nameSourceStats['unknown']} (${Math.floor((nameSourceStats['unknown'] / showList.length) * 100)}%)`);
+        console.log(`Metadata file: ${PRECACHED_METADATA_FILE}`);
+        
+    } catch (error) {
+        console.error('Error in main process:', error.message);
     }
-    
-    // Final save
-    fs.writeFileSync(METADATA_FILE, JSON.stringify(metadataCache, null, 2), 'utf8');
-    console.log(`\nDownload complete! Metadata saved for ${completedShows}/${totalShows} shows.`);
-    console.log(`Name extraction statistics:
-- JSON-LD: ${metadataCache.stats.jsonld} (${Math.round((metadataCache.stats.jsonld/totalShows)*100)}%)
-- HTML fallback: ${metadataCache.stats.html} (${Math.round((metadataCache.stats.html/totalShows)*100)}%)
-- Errors: ${metadataCache.stats.error} (${Math.round((metadataCache.stats.error/totalShows)*100)}%)
-- Unknown: ${metadataCache.stats.unknown} (${Math.round((metadataCache.stats.unknown/totalShows)*100)}%)`);
-    console.log(`Metadata file: ${METADATA_FILE}`);
 }
 
 main().catch(err => {
