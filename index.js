@@ -976,22 +976,85 @@ const BATCH_SIZE = 10; // Number of shows to process in each batch
 let refreshInterval = null;
 
 // --- Background Refresh Functions ---
-const processShowMetadata = async (showUrl) => {
+const processShowMetadata = async (url) => {
     try {
-        console.log(`Processing metadata for show: ${showUrl}`);
-        const details = await extractShowName(showUrl);
+        console.log(`Fetching fresh details for ${url}`);
+        const response = await axios.get(`${BASE_URL}${url}`, {
+            timeout: REQUEST_TIMEOUT_MS * 2,
+            maxRedirects: 5
+        });
+
+        // Parse the HTML
+        const $ = cheerio.load(response.data);
         
-        if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
+        // Extract JSON-LD data for show name (more accurate)
+        let name = '';
+        const jsonLdScript = $('script[type="application/ld+json"]').html();
+        if (jsonLdScript) {
+            try {
+                const jsonData = JSON.parse(jsonLdScript);
+                
+                // Check if this is a TVSeason and get the series name
+                if (jsonData['@type'] === 'TVSeason' && jsonData.partOfTVSeries) {
+                    name = jsonData.partOfTVSeries.name;
+                    console.log(`Found TVSeason, using series name: ${name}`);
+                } else {
+                    // Regular TVSeries handling
+                    name = jsonData.name;
+                }
+                
+                console.log(`Extracted name from JSON-LD: ${name}`);
+                
+                // Add season info if available
+                if (jsonData.containsSeason && Array.isArray(jsonData.containsSeason) && jsonData.containsSeason.length > 1) {
+                    const seasonsCount = jsonData.containsSeason.length;
+                    name = `${name} (${seasonsCount} עונות)`;
+                }
+            } catch (jsonError) {
+                console.warn(`Error parsing JSON-LD for ${url}: ${jsonError.message}`);
+            }
+        }
+        
+        // Fallback to meta tags if JSON-LD extraction failed
+        if (!name) {
+            name = $('meta[property="og:title"]').attr('content') ||
+                   $('meta[name="title"]').attr('content') ||
+                   $('title').text();
+            
+            // Clean up the name
+            if (name) {
+                name = name.replace('מאקו', '').replace('VOD', '').trim();
+            }
+        }
+        
+        // Get background image
+        const background = $('meta[property="og:image"]').attr('content') || 
+                          $('.hero-image img').attr('src') || 
+                          $('.show-image img').attr('src');
+                          
+        // Get poster image
+        let poster = $('.vod-item img').attr('src') || 
+                     $('.show-poster img').attr('src') || 
+                     $('meta[property="og:image:secure_url"]').attr('content');
+                     
+        if (!poster && background) {
+            poster = background;
+        }
+        
+        // Only return metadata if we have the necessary fields
+        if (name && (poster || background)) {
             return {
-                name: details.name,
-                poster: details.poster,
-                background: details.background,
+                name,
+                poster,
+                background: background || poster,
                 lastUpdated: Date.now()
             };
         }
+        
+        console.warn(`Could not extract metadata for ${url}`);
         return null;
-    } catch (err) {
-        console.error(`Error processing metadata for ${showUrl}:`, err.message);
+    } catch (error) {
+        console.error(`Error processing show metadata for ${url}:`, error.message);
         return null;
     }
 };
