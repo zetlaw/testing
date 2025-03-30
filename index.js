@@ -364,41 +364,10 @@ const extractContent = async (url, contentType) => {
                 filter: (item) => {
                     if (!item.url) return false;
                     
-                    // Clean up the name
-                    if (item.name) {
-                        item.name = item.name
-                            .replace(/\s+/g, ' ') // Replace multiple spaces with single space
-                            .replace(/[-–—]/g, ' ') // Replace various dashes with space
-                            .replace(/[^\u0590-\u05FF\s]/g, '') // Keep only Hebrew characters and spaces
-                            .trim();
-                    }
-                    
-                    // If no name after cleaning, try to get it from the URL
-                    if (!item.name || item.name.length < 2) {
-                        const urlParts = item.url.split('/');
-                        const lastPart = urlParts[urlParts.length - 1];
-                        item.name = lastPart
-                            .replace(/_/g, ' ')
-                            .replace(/-/g, ' ')
-                            .replace(/\b\w/g, l => l.toUpperCase())
-                            .trim();
-                    }
-                    
-                    // Skip if still no valid name
-                    if (!item.name || item.name.length < 2) return false;
-                    
-                    // Skip if contains unwanted terms
-                    const lowerName = item.name.toLowerCase();
-                    if (lowerName.includes('live')) return false;
-                    if (lowerName.includes('יחצ')) return false;
-                    if (lowerName.includes('מאקו')) return false;
-                    if (lowerName.includes('פוסטר')) return false;
-                    if (lowerName.includes('סט')) return false;
-                    if (lowerName.includes('hd')) return false;
-                    if (lowerName.includes('wow')) return false;
-                    if (lowerName.includes('ז\'אנר')) return false;
-                    if (lowerName.includes('כרטיס')) return false;
-                    if (lowerName.includes('מובייל')) return false;
+                    // Only filter out obviously invalid URLs
+                    if (item.url.includes('purchase')) return false;
+                    if (item.url.includes('index')) return false;
+                    if (item.url.includes('live')) return false;
                     
                     return true;
                 }
