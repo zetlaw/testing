@@ -909,11 +909,17 @@ let refreshInterval = null;
 
 // --- Background Refresh Functions ---
 const processShowBatch = async (shows, cache) => {
+    console.log(`Background: Starting batch of ${shows.length} shows`);
     const batchPromises = shows.map(async (show) => {
         try {
-            if (!show.url) return null;
+            if (!show.url) {
+                console.warn('Background: Show missing URL, skipping');
+                return null;
+            }
             
+            console.log(`Background: Processing show: ${show.url}`);
             const details = await extractShowName(show.url);
+            
             if (details && details.name && details.name !== 'Unknown Show' && details.name !== 'Error Loading') {
                 if (!cache.shows) cache.shows = {};
                 cache.shows[show.url] = {
@@ -922,7 +928,9 @@ const processShowBatch = async (shows, cache) => {
                     background: details.background,
                     lastUpdated: Date.now()
                 };
-                console.log(`Background: Updated metadata for ${details.name}`);
+                console.log(`Background: Successfully updated metadata for ${details.name}`);
+            } else {
+                console.warn(`Background: Invalid details for ${show.url}:`, details);
             }
             await sleep(100); // Small delay between requests
         } catch (err) {
@@ -930,7 +938,12 @@ const processShowBatch = async (shows, cache) => {
         }
     });
 
-    await Promise.all(batchPromises);
+    try {
+        await Promise.all(batchPromises);
+        console.log('Background: Batch completed successfully');
+    } catch (err) {
+        console.error('Background: Batch failed:', err);
+    }
 };
 
 const backgroundRefresh = async () => {
@@ -949,13 +962,20 @@ const backgroundRefresh = async () => {
         for (let i = 0; i < shows.length; i += BATCH_SIZE) {
             const batch = shows.slice(i, i + BATCH_SIZE);
             console.log(`Background: Processing batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(shows.length/BATCH_SIZE)}`);
-            await processShowBatch(batch, cache);
             
-            // Save cache after each batch
-            await saveCache(cache);
-            console.log(`Background: Saved cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
-            
-            await sleep(1000); // Delay between batches
+            try {
+                await processShowBatch(batch, cache);
+                
+                // Save cache after each batch
+                await saveCache(cache);
+                console.log(`Background: Saved cache after batch ${Math.floor(i/BATCH_SIZE) + 1}`);
+                
+                await sleep(1000); // Delay between batches
+            } catch (batchError) {
+                console.error(`Background: Error in batch ${Math.floor(i/BATCH_SIZE) + 1}:`, batchError);
+                // Continue with next batch even if this one failed
+                continue;
+            }
         }
 
         console.log('Background: Completed refresh of show metadata');
@@ -1022,18 +1042,21 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         for (const show of initialShows) {
             try {
                 // Check cache first
-                if (cache.shows && cache.shows[show.url] && isCacheFresh) {
+                if (cache.shows && cache.shows[show.url]) {
+                    const cachedData = cache.shows[show.url];
                     processedShows.push({
                         ...show,
-                        name: cache.shows[show.url].name || show.name,
-                        poster: cache.shows[show.url].poster || show.poster,
-                        background: cache.shows[show.url].background || show.poster
+                        name: cachedData.name || show.name,
+                        poster: cachedData.poster || show.poster,
+                        background: cachedData.background || show.poster
                     });
+                    console.log(`Catalog: Using cached data for ${cachedData.name || show.name}`);
                     continue;
                 }
 
                 // If not in cache, use basic show info
                 processedShows.push(show);
+                console.log(`Catalog: Using basic info for ${show.name}`);
             } catch (err) {
                 console.error(`Error processing show ${show.url}:`, err.message);
                 processedShows.push(show);
