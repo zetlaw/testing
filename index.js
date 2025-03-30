@@ -1240,8 +1240,12 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         // Create a base64 token from the HLS URL
         const proxyToken = Buffer.from(videoUrl).toString('base64');
-        // Get the base URL for the current request
-        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        
+        // Get the host from request and ensure it uses HTTPS
+        const host = req.get('host');
+        // Force HTTPS for the baseUrl regardless of the original request protocol
+        const baseUrl = `https://${host}`;
+        
         // Create a proxied URL
         const proxiedUrl = `${baseUrl}/proxy/${proxyToken}`;
 
@@ -1376,7 +1380,8 @@ app.get('/proxy/:token', async (req, res) => {
                             // If it's another m3u8 file, proxy it too
                             if (line.includes('.m3u8')) {
                                 const proxyToken = Buffer.from(absoluteUrl).toString('base64');
-                                return `${req.protocol}://${req.get('host')}/proxy/${proxyToken}`;
+                                // Force HTTPS for the proxy URL regardless of the original request protocol
+                                return `https://${req.get('host')}/proxy/${proxyToken}`;
                             }
                             
                             return absoluteUrl;
@@ -1385,7 +1390,8 @@ app.get('/proxy/:token', async (req, res) => {
                         // If it's already an absolute URL that is a playlist, proxy it
                         if (line.includes('.m3u8')) {
                             const proxyToken = Buffer.from(line).toString('base64');
-                            return `${req.protocol}://${req.get('host')}/proxy/${proxyToken}`;
+                            // Force HTTPS for the proxy URL
+                            return `https://${req.get('host')}/proxy/${proxyToken}`;
                         }
                         
                         return line;
@@ -1782,8 +1788,12 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 
         // Create a base64 token from the HLS URL
         const proxyToken = Buffer.from(videoUrl).toString('base64');
-        // Get the base URL for the current request
-        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        
+        // Get the host from request and ensure it uses HTTPS
+        const host = req.get('host');
+        // Force HTTPS for the baseUrl regardless of the original request protocol
+        const baseUrl = `https://${host}`;
+        
         // Create a proxied URL
         const proxiedUrl = `${baseUrl}/proxy/${proxyToken}`;
 
