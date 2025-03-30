@@ -787,16 +787,42 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             }
         }
         
-        // Call the handler we defined with defineCatalogHandler but directly
-        const handlerResult = await addonInterface.get({ 
-            resource: 'catalog', 
-            type, 
-            id, 
-            extra 
-        });
+        // Check if valid catalog request for our addon
+        if (type !== 'series' || id !== 'mako-vod-shows') {
+            return res.send({ metas: [] });
+        }
         
-        res.setHeader('Content-Type', 'application/json');
-        res.send(handlerResult);
+        // Implement simplified catalog logic directly
+        try {
+            const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
+            const search = extra?.search?.toLowerCase() || '';
+
+            let filteredShows = shows;
+            if (search) {
+                console.log(`Searching for: ${search}`);
+                // Ensure name exists before filtering
+                filteredShows = shows.filter(show => show.name && show.name.toLowerCase().includes(search));
+                console.log(`Found ${filteredShows.length} matching shows`);
+            }
+
+            const metas = filteredShows.map(show => ({
+                id: `mako:${encodeURIComponent(show.url)}`,
+                type: 'series',
+                name: show.name || 'Loading...',
+                poster: show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+                posterShape: 'poster',
+                background: show.background || show.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+                logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+                description: 'מאקו VOD',
+            }));
+
+            res.setHeader('Content-Type', 'application/json');
+            res.send({ metas });
+        } catch (error) {
+            console.error('Error building catalog:', error);
+            res.setHeader('Content-Type', 'application/json');
+            res.send({ metas: [] });
+        }
     } catch (err) {
         console.error('Catalog error:', err);
         res.status(500).json({ error: 'Error processing catalog request', message: err.message });
@@ -809,15 +835,97 @@ app.get('/meta/:type/:id.json', async (req, res) => {
         console.log('Processing meta request:', req.params);
         const { type, id } = req.params;
         
-        // Call the handler we defined with defineMetaHandler but directly
-        const handlerResult = await addonInterface.get({ 
-            resource: 'meta', 
-            type, 
-            id 
-        });
-        
-        res.setHeader('Content-Type', 'application/json');
-        res.send(handlerResult);
+        // Check if valid meta request for our addon
+        if (type !== 'series' || !id.startsWith('mako:')) {
+            return res.send({ meta: null });
+        }
+
+        const showUrl = decodeURIComponent(id.replace('mako:', ''));
+
+        try {
+            // Attempt to get basic show info quickly from cache or minimal fetch
+            const cache = loadCache();
+            const cachedShowData = cache.shows[showUrl];
+            let showName = cachedShowData?.name || 'Loading...';
+            let showPoster = cachedShowData?.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
+            let showBackground = cachedShowData?.background || showPoster;
+
+            // If not cached, fetch basic details
+            if (!cachedShowData) {
+                const showDetails = await extractShowName(showUrl);
+                if(showDetails) {
+                    showName = showDetails.name;
+                    showPoster = showDetails.poster;
+                    showBackground = showDetails.background;
+                }
+            }
+
+            const seasons = await extractContent(showUrl, 'seasons');
+            const videos = [];
+
+            // If no seasons dropdown, check for episodes directly on the show page
+            let episodesToProcess = [];
+            if (!seasons || seasons.length === 0) {
+                console.log(`No seasons found for ${showUrl}, checking for episodes directly.`);
+                episodesToProcess = await extractContent(showUrl, 'episodes');
+                if (episodesToProcess.length > 0) {
+                    // Assign a default season number if none are specified
+                    episodesToProcess.forEach((ep, index) => {
+                        ep.seasonNum = 1;
+                        ep.episodeNum = index + 1;
+                    });
+                }
+            } else {
+                for (const season of seasons) {
+                    const episodes = await extractContent(season.url, 'episodes');
+                    const seasonNum = parseInt(season.name?.match(/\d+/)?.[0] || '1'); // Default to 1 if no number
+                    episodes.forEach((episode, index) => {
+                        if (episode.guid) {
+                            episode.seasonNum = seasonNum;
+                            episode.episodeNum = index + 1; // Simple episode index within season fetch
+                            episodesToProcess.push(episode);
+                        }
+                    });
+                }
+            }
+
+            // Sort all collected episodes
+            episodesToProcess.sort((a, b) => {
+                if (a.seasonNum !== b.seasonNum) return a.seasonNum - b.seasonNum;
+                return a.episodeNum - b.episodeNum;
+            });
+
+            // Create video objects for Stremio
+            episodesToProcess.forEach(episode => {
+                videos.push({
+                    id: `${id}:ep:${episode.guid}`,
+                    title: episode.name || `Episode ${episode.episodeNum}`,
+                    season: episode.seasonNum,
+                    episode: episode.episodeNum,
+                });
+            });
+
+            const metaResponse = {
+                meta: {
+                    id,
+                    type: 'series',
+                    name: showName,
+                    poster: showPoster,
+                    posterShape: 'poster',
+                    background: showBackground,
+                    logo: 'https://www.mako.co.il/assets/images/svg/mako_logo.svg',
+                    description: 'מאקו VOD',
+                    videos
+                }
+            };
+            
+            res.setHeader('Content-Type', 'application/json');
+            res.send(metaResponse);
+        } catch (error) {
+            console.error(`Error in meta handler for ${id}:`, error);
+            res.setHeader('Content-Type', 'application/json');
+            res.send({ meta: null });
+        }
     } catch (err) {
         console.error('Meta error:', err);
         res.status(500).json({ error: 'Error processing meta request', message: err.message });
@@ -830,15 +938,71 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         console.log('Processing stream request:', req.params);
         const { type, id } = req.params;
         
-        // Call the handler we defined with defineStreamHandler but directly
-        const handlerResult = await addonInterface.get({ 
-            resource: 'stream', 
-            type, 
-            id 
-        });
-        
-        res.setHeader('Content-Type', 'application/json');
-        res.send(handlerResult);
+        // Check if valid stream request for our addon
+        if (type !== 'series' || !id.startsWith('mako:')) {
+            return res.send({ streams: [] });
+        }
+
+        const [showIdRaw, episodeGuid] = id.split(':ep:');
+        if (!showIdRaw || !episodeGuid) {
+            console.error(`Stream handler: Invalid ID format ${id}`);
+            return res.send({ streams: [] });
+        }
+
+        const showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
+        console.log(`Stream handler: Looking for GUID ${episodeGuid} within show ${showUrl}`);
+
+        let episodeUrl = null;
+        try {
+            // Find episode URL logic
+            const seasons = await extractContent(showUrl, 'seasons');
+            let episodesFound = [];
+            if (!seasons || seasons.length === 0) {
+                episodesFound = await extractContent(showUrl, 'episodes');
+            } else {
+                for (const season of seasons) {
+                    const episodes = await extractContent(season.url, 'episodes');
+                    episodesFound.push(...episodes);
+                    // Optimization: Check if the episode is found in this season's fetch
+                    if (episodes.some(ep => ep.guid === episodeGuid)) {
+                        console.log(`Stream handler: Found GUID ${episodeGuid} in season ${season.name || 'unknown'}`);
+                        break; // Stop fetching more seasons if found
+                    }
+                }
+            }
+            
+            const episode = episodesFound.find(ep => ep.guid === episodeGuid);
+            if (episode && episode.url) {
+                episodeUrl = episode.url;
+                console.log(`Stream handler: Found episode URL: ${episodeUrl}`);
+            } else {
+                console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid}`);
+                return res.send({ streams: [] });
+            }
+
+            // Get the HLS URL
+            const videoUrl = await getVideoUrl(episodeUrl);
+
+            if (!videoUrl) {
+                console.error(`Stream handler: getVideoUrl failed for ${episodeUrl}`);
+                return res.send({ streams: [] });
+            }
+
+            console.log(`Stream handler: Got video URL: ${videoUrl}`);
+
+            // Return stream object
+            const streams = [{
+                url: videoUrl,
+                title: 'Play (Default Player)',
+            }];
+
+            res.setHeader('Content-Type', 'application/json');
+            res.send({ streams });
+        } catch (error) {
+            console.error(`Stream handler error: ${error.message}`);
+            res.setHeader('Content-Type', 'application/json');
+            res.send({ streams: [] });
+        }
     } catch (err) {
         console.error('Stream error:', err);
         res.status(500).json({ error: 'Error processing stream request', message: err.message });
