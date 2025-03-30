@@ -18,16 +18,30 @@ const EPISODE_FETCH_TIMEOUT_MS = 20000;
 const BATCH_SIZE = 5;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
+// Detect if we're running in a serverless environment
+const IS_SERVERLESS = process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.VERCEL || process.env.NETLIFY;
+const WRITABLE_DIR = IS_SERVERLESS ? '/tmp' : __dirname;
+
 // --- Cache Paths ---
-const LOCAL_CACHE_DIR = path.join(__dirname, '.cache');
+const LOCAL_CACHE_DIR = path.join(WRITABLE_DIR, '.cache');
 const LOCAL_CACHE_FILE = path.join(LOCAL_CACHE_DIR, 'shows.json');
 const LOCAL_METADATA_FILE = path.join(LOCAL_CACHE_DIR, "metadata.json");
 const BLOB_METADATA_KEY_PREFIX = 'mako-shows-metadata-v1';
 const MAX_BLOB_FILES_TO_KEEP = 2;
 
 // --- Precached data paths ---
+// Keep precached data in the read-only filesystem since it's pregenerated
 const PRECACHED_DIR = path.join(__dirname, 'precached');
 const PRECACHED_METADATA_FILE = path.join(PRECACHED_DIR, 'metadata.json');
+
+// --- Headers ---
+const HEADERS = {
+    'User-Agent': USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
+    'Referer': 'https://www.mako.co.il/mako-vod-index',
+    'Connection': 'keep-alive'
+};
 
 // --- Background Queue Configuration ---
 const QUEUE_BATCH_SIZE = 5;
@@ -917,12 +931,68 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             return res.status(400).json({ meta: null, error: 'Invalid show URL in ID' });
         }
 
-        const metadataCache = await loadCache();
-        const { details: showDetails } = await getOrUpdateShowMetadata(showUrl, metadataCache);
-        const { episodes } = await getShowEpisodes(showUrl, metadataCache);
-        await saveCache(metadataCache);
-
-        const videos = episodes.map(ep => ({
+        // Get metadata for the show (will use cache if available)
+        const showDetails = await getMetadata(showUrl);
+        
+        // Queue background fetch for episodes
+        queueMetadataFetch(showUrl, 2); // High priority
+        
+        // This function needs to be adapted to work with our new approach
+        // It should handle multiple seasons and extract episodes
+        const episodes = await extractContent(showUrl, 'episodes');
+        
+        // Process episodes for multiple seasons if needed
+        let allEpisodes = episodes || [];
+        try {
+            const seasons = await extractContent(showUrl, 'seasons');
+            if (seasons && seasons.length > 0) {
+                console.log(`Found ${seasons.length} seasons for ${showUrl}`);
+                
+                // Process first 2 seasons only to avoid timeouts
+                const seasonBatch = seasons.slice(0, 2);
+                const seasonPromises = seasonBatch.map(async (season, index) => {
+                    if (!season.url) return [];
+                    
+                    console.log(`Fetching episodes for season ${index + 1}: ${season.name || season.url}`);
+                    const seasonEpisodes = await extractContent(season.url, 'episodes');
+                    
+                    // Add season and episode numbers
+                    return (seasonEpisodes || []).map((ep, i) => ({
+                        ...ep,
+                        seasonNum: index + 1,
+                        episodeNum: i + 1
+                    }));
+                });
+                
+                const seasonEpisodes = await Promise.all(seasonPromises);
+                allEpisodes = [...allEpisodes, ...seasonEpisodes.flat()];
+                
+                // Queue background processing for remaining seasons
+                if (seasons.length > 2) {
+                    console.log(`Queueing remaining ${seasons.length - 2} seasons for background processing`);
+                    // This would require additional background processing logic that 
+                    // we could implement as a separate feature
+                }
+            } else {
+                // If single season, add season and episode numbers
+                allEpisodes = allEpisodes.map((ep, i) => ({
+                    ...ep,
+                    seasonNum: 1,
+                    episodeNum: i + 1
+                }));
+            }
+        } catch (error) {
+            console.error(`Error processing seasons for ${showUrl}:`, error.message);
+            // If we failed to get multiple seasons, at least use what we have
+            allEpisodes = allEpisodes.map((ep, i) => ({
+                ...ep,
+                seasonNum: 1,
+                episodeNum: i + 1
+            }));
+        }
+        
+        // Organize episodes into seasons
+        const videos = allEpisodes.map(ep => ({
             id: `${id}:ep:${ep.guid}`,
             title: ep.name || `Episode ${ep.episodeNum}`,
             season: ep.seasonNum,
@@ -977,9 +1047,23 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             return res.status(400).json({ streams: [], error: 'Invalid show URL in ID' });
         }
 
-        const metadataCache = await loadCache();
-        const { episodes } = await getShowEpisodes(showUrl, metadataCache);
-        const targetEpisode = episodes.find(ep => ep.guid === episodeGuid);
+        // Find episode URL from GUID - we're not caching episodes yet, so we need to fetch them
+        const episodes = await extractContent(showUrl, 'episodes');
+        let targetEpisode = episodes.find(ep => ep.guid === episodeGuid);
+        
+        // If not found in main page, try looking in seasons
+        if (!targetEpisode) {
+            const seasons = await extractContent(showUrl, 'seasons');
+            if (seasons && seasons.length > 0) {
+                for (const season of seasons) {
+                    if (!season.url) continue;
+                    
+                    const seasonEpisodes = await extractContent(season.url, 'episodes');
+                    targetEpisode = seasonEpisodes.find(ep => ep.guid === episodeGuid);
+                    if (targetEpisode) break;
+                }
+            }
+        }
 
         if (!targetEpisode || !targetEpisode.url) {
             console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
@@ -1018,11 +1102,12 @@ app.use((req, res) => {
     res.status(404).json({ error: 'Not Found' });
 });
 
-// Export the app for Vercel
+// Export the app for serverless platforms
 module.exports = app;
 
 // --- Local Development Server ---
-if (!IS_PRODUCTION) {
+// Only start the server if not running in a serverless environment
+if (!IS_SERVERLESS) {
     const PORT = process.env.PORT || 8000;
     app.listen(PORT, () => {
         console.log(`\n--- LOCAL DEVELOPMENT SERVER ---`);
