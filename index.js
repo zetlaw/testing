@@ -74,12 +74,15 @@ const loadCache = async () => {
             };
 
             try {
-                // Try to get the blob
-                const headResult = await blob.head(BLOB_CACHE_KEY);
-                if (headResult && headResult.size > 0) {
-                    console.log(`Found cache blob: ${headResult.pathname}, Size: ${headResult.size}, URL: ${headResult.url}`);
+                // List blobs to find the most recent one
+                const { blobs } = await blob.list({ prefix: BLOB_CACHE_KEY });
+                if (blobs && blobs.length > 0) {
+                    // Sort by lastModified and get the most recent
+                    const mostRecent = blobs.sort((a, b) => b.lastModified - a.lastModified)[0];
+                    console.log(`Found most recent cache blob: ${mostRecent.pathname}, Size: ${mostRecent.size}, URL: ${mostRecent.url}`);
+                    
                     // Fetch the actual cache data
-                    const response = await axios.get(headResult.url, { timeout: 5000 });
+                    const response = await axios.get(mostRecent.url, { timeout: 5000 });
                     // Validate fetched data
                     if (typeof response.data === 'object' && response.data !== null) {
                         memoryCache = response.data;
@@ -93,11 +96,11 @@ const loadCache = async () => {
                 }
             } catch (headError) {
                 if (!headError.message.includes('404')) {
-                    console.error("Blob head request failed:", headError);
+                    console.error("Blob list request failed:", headError);
                 }
             }
 
-            // If we get here, either the blob doesn't exist or it's invalid
+            // If we get here, either no blobs exist or they're invalid
             console.log("Initializing new cache");
             memoryCache = emptyCache;
             memoryCacheTimestamp = now;
@@ -899,14 +902,12 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
         const shows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
         console.log(`Extracted ${shows.length} initial shows`);
 
-        // Process show details in parallel with limits
+        // Process show details in parallel with rate limiting
         const batchSize = 5; // Process 5 shows at a time
-        const maxShows = process.env.NODE_ENV === 'production' ? 50 : 200;
-        const showsToProcess = shows.slice(0, maxShows);
         const processedShows = [];
 
-        for (let i = 0; i < showsToProcess.length; i += batchSize) {
-            const batch = showsToProcess.slice(i, i + batchSize);
+        for (let i = 0; i < shows.length; i += batchSize) {
+            const batch = shows.slice(i, i + batchSize);
             const batchPromises = batch.map(async (show) => {
                 // Check cache first
                 if (cache.shows && cache.shows[show.url] && isCacheFresh) {
