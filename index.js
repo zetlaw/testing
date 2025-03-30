@@ -7,6 +7,16 @@ const path = require('path');
 // Use the external crypto.js module
 const { CRYPTO, cryptoOp } = require('./crypto');
 
+// Import Vercel Blob for serverless storage
+let blob;
+if (process.env.NODE_ENV === 'production') {
+    try {
+        blob = require('@vercel/blob');
+    } catch (e) {
+        console.error('Failed to load @vercel/blob, cache will not persist:', e.message);
+    }
+}
+
 // Constants
 const BASE_URL = "https://www.mako.co.il";
 const CACHE_FILE = path.join(__dirname, "mako_shows_cache.json");
@@ -14,6 +24,7 @@ const CACHE_TTL = 30 * 24 * 60 * 60; // 30 days in seconds
 const DELAY_BETWEEN_REQUESTS = 1000; // 1 second in milliseconds
 const MAX_RETRIES = 3;
 const REQUEST_TIMEOUT = 10000;
+const BLOB_CACHE_KEY = 'mako-shows-cache.json'; // Key for Vercel Blob Storage
 
 // Headers for requests
 const HEADERS = {
@@ -24,40 +35,103 @@ const HEADERS = {
     'Connection': 'keep-alive'
 };
 
-// Cache management (modified for serverless)
-const loadCache = () => {
-    // In production/serverless, use empty cache
-    if (process.env.NODE_ENV === 'production') {
-        console.log("Running in production/serverless mode - using in-memory cache only");
-        return { timestamp: Date.now(), shows: {} };
+// In-memory cache to avoid multiple blob fetches in a single execution
+let memoryCache = null;
+
+// Cache management (modified for Vercel Blob Storage)
+const loadCache = async () => {
+    // Use the in-memory cache if it exists
+    if (memoryCache) {
+        return memoryCache;
     }
     
+    // In production/serverless, use Vercel Blob Storage
+    if (process.env.NODE_ENV === 'production') {
+        if (!blob) {
+            console.log("Vercel Blob not available - using empty cache");
+            memoryCache = { timestamp: Date.now(), shows: {} };
+            return memoryCache;
+        }
+
+        try {
+            console.log("Attempting to load cache from Vercel Blob Storage");
+            const blobList = await blob.list();
+            
+            const cacheBlob = blobList.blobs.find(b => b.pathname === BLOB_CACHE_KEY);
+            if (cacheBlob) {
+                const cacheUrl = cacheBlob.url;
+                console.log(`Found cache blob at ${cacheUrl}`);
+                
+                const response = await axios.get(cacheUrl);
+                memoryCache = response.data;
+                console.log(`Successfully loaded cache from Blob storage with ${Object.keys(memoryCache.shows).length} items`);
+                return memoryCache;
+            } else {
+                console.log("No cache blob found - starting with empty cache");
+                memoryCache = { timestamp: Date.now(), shows: {} };
+                return memoryCache;
+            }
+        } catch (e) {
+            console.error("Error loading cache from Blob storage:", e);
+            memoryCache = { timestamp: Date.now(), shows: {} };
+            return memoryCache;
+        }
+    }
+    
+    // Local development - use file system
     try {
         if (fs.existsSync(CACHE_FILE)) {
-            return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+            const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+            memoryCache = data;
+            return memoryCache;
         }
-        return { timestamp: Date.now(), shows: {} };
+        memoryCache = { timestamp: Date.now(), shows: {} };
+        return memoryCache;
     } catch (e) {
-        console.error("Error loading cache:", e);
-        return { timestamp: Date.now(), shows: {} };
+        console.error("Error loading cache from file:", e);
+        memoryCache = { timestamp: Date.now(), shows: {} };
+        return memoryCache;
     }
 };
 
-const saveCache = (cache) => {
-    // Skip file operations in production/serverless
+const saveCache = async (cache) => {
+    // Always update memory cache
+    memoryCache = cache;
+    
+    // In production/serverless, use Vercel Blob Storage
     if (process.env.NODE_ENV === 'production') {
+        if (!blob) {
+            console.log("Vercel Blob not available - cache will not persist");
+            return;
+        }
+        
+        try {
+            console.log(`Saving cache to Vercel Blob with ${Object.keys(cache.shows).length} items`);
+            const cacheData = JSON.stringify(cache);
+            
+            // Upload as application/json MIME type
+            await blob.put(BLOB_CACHE_KEY, cacheData, {
+                contentType: 'application/json',
+                access: 'public' // Make it publicly accessible so we can fetch it
+            });
+            
+            console.log("Cache saved successfully to Vercel Blob");
+        } catch (e) {
+            console.error("Error saving cache to Blob storage:", e);
+        }
         return;
     }
     
+    // Local development - use file system
     try {
         const cacheDir = path.dirname(CACHE_FILE);
         if (!fs.existsSync(cacheDir)) {
             fs.mkdirSync(cacheDir, { recursive: true });
         }
         fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
-        console.log("Cache saved successfully");
+        console.log("Cache saved successfully to file");
     } catch (e) {
-        console.error("Error saving cache:", e);
+        console.error("Error saving cache to file:", e);
     }
 };
 
@@ -143,7 +217,7 @@ const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => 
     let processedCount = 0;
 
     // In serverless, limit the shows to process
-    let showLimit = process.env.NODE_ENV === 'production' ? 10 : null;
+    let showLimit = process.env.NODE_ENV === 'production' ? 20 : null;
     // If caller specified a limit, use the lower of the two
     if (maxShows !== null) {
         showLimit = showLimit ? Math.min(showLimit, maxShows) : maxShows;
@@ -226,7 +300,7 @@ const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => 
 
         if (updatesCount > 0) {
             cache.timestamp = Date.now();
-            saveCache(cache);
+            await saveCache(cache);
             updatesCount = 0; // Reset after save
         }
         
@@ -237,7 +311,7 @@ const processShowNames = async (shows, cache, cacheIsFresh, maxShows = null) => 
     // Final save if any pending updates
     if (updatesCount > 0) {
          cache.timestamp = Date.now();
-         saveCache(cache);
+         await saveCache(cache);
     }
 };
 
@@ -347,7 +421,7 @@ const extractContent = async (url, contentType) => {
         }
 
         if (contentType === 'shows') {
-            const cache = loadCache();
+            const cache = await loadCache();
             const cacheIsFresh = Date.now() - cache.timestamp < CACHE_TTL;
 
             console.log("\nLoading accurate show names...");
@@ -388,7 +462,7 @@ const extractContent = async (url, contentType) => {
             } else {
                 console.log(`Need to fetch/update ${toFetch.length} show names`);
                 // Start background processing without await
-                 processShowNames(toFetch, cache, cacheIsFresh).catch(err => console.error("Background show name processing failed:", err));
+                processShowNames(toFetch, cache, cacheIsFresh).catch(err => console.error("Background show name processing failed:", err));
             }
         }
 
@@ -632,19 +706,28 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
     try {
          // Attempt to get basic show info quickly from cache or minimal fetch
-         const cache = loadCache();
+         const cache = await loadCache();
          const cachedShowData = cache.shows[showUrl];
          let showName = cachedShowData?.name || 'Loading...';
          let showPoster = cachedShowData?.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
          let showBackground = cachedShowData?.background || showPoster;
 
-         // If not cached, fetch basic details (extractContent does this)
+         // If not cached, fetch basic details
          if (!cachedShowData) {
-             const showDetails = await extractShowName(showUrl); // Fetch specific show details if needed
+             const showDetails = await extractShowName(showUrl);
              if(showDetails) {
                  showName = showDetails.name;
                  showPoster = showDetails.poster;
                  showBackground = showDetails.background;
+                 
+                 // Save to cache for future use
+                 if (!cache.shows[showUrl]) cache.shows[showUrl] = {};
+                 cache.shows[showUrl].name = showDetails.name;
+                 cache.shows[showUrl].poster = showDetails.poster;
+                 cache.shows[showUrl].background = showDetails.background;
+                 cache.shows[showUrl].lastUpdated = Date.now();
+                 
+                 await saveCache(cache);
              }
          }
 
@@ -855,6 +938,12 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
                 console.log(`Found ${filteredShows.length} matching shows`);
             }
 
+            // In serverless, limit shows for performance
+            if (process.env.NODE_ENV === 'production' && !search && filteredShows.length > 100) {
+                console.log(`Limiting to 100 shows in production mode for performance`);
+                filteredShows = filteredShows.slice(0, 100);
+            }
+
             const metas = filteredShows.map(show => ({
                 id: `mako:${encodeURIComponent(show.url)}`,
                 type: 'series',
@@ -894,7 +983,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
 
         try {
             // Attempt to get basic show info quickly from cache or minimal fetch
-            const cache = loadCache();
+            const cache = await loadCache();
             const cachedShowData = cache.shows[showUrl];
             let showName = cachedShowData?.name || 'Loading...';
             let showPoster = cachedShowData?.poster || 'https://www.mako.co.il/assets/images/svg/mako_logo.svg';
@@ -907,6 +996,15 @@ app.get('/meta/:type/:id.json', async (req, res) => {
                     showName = showDetails.name;
                     showPoster = showDetails.poster;
                     showBackground = showDetails.background;
+                    
+                    // Save to cache for future use
+                    if (!cache.shows[showUrl]) cache.shows[showUrl] = {};
+                    cache.shows[showUrl].name = showDetails.name;
+                    cache.shows[showUrl].poster = showDetails.poster;
+                    cache.shows[showUrl].background = showDetails.background;
+                    cache.shows[showUrl].lastUpdated = Date.now();
+                    
+                    await saveCache(cache);
                 }
             }
 
