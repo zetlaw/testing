@@ -164,34 +164,27 @@ const saveCache = async (cache) => {
 
     if (blob) { // Production with Vercel Blob
         try {
-            console.log(`Attempting to save cache (${showCount} shows, ${seasonCount} seasons) to Blob: ${BLOB_CACHE_KEY}`);
-
-            // Save the cache file with the consistent name
-            const putResult = await blob.put(BLOB_CACHE_KEY, JSON.stringify(cacheToSave), {
-                access: 'public',
-                contentType: 'application/json'
-            });
-            console.log(`Cache saved successfully to Blob: ${putResult.pathname} (URL: ${putResult.url})`);
-
-            // Clean up any old cache files (best effort)
+            // First, delete any existing cache files
             try {
                 const { blobs } = await blob.list({ prefix: 'mako-shows-cache-v1' });
-                const validBlobs = blobs.filter(b => b.uploadedAt && b.pathname !== BLOB_CACHE_KEY);
-                
-                if (validBlobs.length > 0) {
-                    console.log(`Found ${validBlobs.length} old cache files to clean up`);
-                    
-                    // Delete old blobs
-                    const deletePromises = validBlobs.map(oldBlob =>
-                        blob.del(oldBlob.url)
-                            .then(() => console.log(`Deleted old cache file: ${oldBlob.pathname}`))
-                            .catch(delError => console.error(`Failed to delete old cache file ${oldBlob.pathname}:`, delError.message))
-                    );
-                    await Promise.all(deletePromises);
-                }
+                const deletePromises = blobs.map(oldBlob =>
+                    blob.del(oldBlob.url)
+                        .then(() => console.log(`Deleted old cache file: ${oldBlob.pathname}`))
+                        .catch(delError => console.error(`Failed to delete old cache file ${oldBlob.pathname}:`, delError.message))
+                );
+                await Promise.all(deletePromises);
             } catch (cleanupError) {
                 console.error("Failed during cache cleanup:", cleanupError.message);
             }
+
+            // Save the new cache file with a deterministic name
+            const putResult = await blob.put(BLOB_CACHE_KEY, JSON.stringify(cacheToSave), {
+                access: 'public',
+                contentType: 'application/json',
+                addRandomSuffix: false // Disable random suffix
+            });
+            console.log(`Cache saved successfully to Blob: ${putResult.pathname} (URL: ${putResult.url})`);
+
         } catch (e) {
             console.error(`Error saving cache to Blob storage:`, e.message);
             if (e.response) {
