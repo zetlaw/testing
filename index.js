@@ -215,7 +215,7 @@ initializeMetadataCache().then(success => {
     // Set a timeout to handle serverless timeouts gracefully
     if (IS_SERVERLESS) {
         // Most serverless platforms have a 10 second timeout
-        const SERVERLESS_TIMEOUT_MS = 9500; // Just under 10 seconds to be safe
+        const SERVERLESS_TIMEOUT_MS = 30000; // Just under 10 seconds to be safe
         
         setTimeout(() => {
             console.log('Serverless timeout approaching, clearing queue and freeing resources');
