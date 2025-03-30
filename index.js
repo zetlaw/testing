@@ -19,11 +19,13 @@ const BATCH_SIZE = 5;
 
 // --- Cache Paths ---
 const LOCAL_CACHE_DIR = path.join(__dirname, '.cache');
-const LOCAL_CACHE_FILE = path.join(LOCAL_CACHE_DIR, "mako_shows_cache.json");
 const LOCAL_METADATA_FILE = path.join(LOCAL_CACHE_DIR, "mako_shows_metadata.json");
-const BLOB_CACHE_KEY_PREFIX = 'mako-shows-cache-v1';
 const BLOB_METADATA_KEY_PREFIX = 'mako-shows-metadata-v1';
 const MAX_BLOB_FILES_TO_KEEP = 2;
+
+// --- Precached data paths ---
+const PRECACHED_DIR = path.join(__dirname, 'precached');
+const PRECACHED_METADATA_FILE = path.join(PRECACHED_DIR, 'metadata.json');
 
 // --- Headers ---
 const HEADERS = {
@@ -59,30 +61,28 @@ if (IS_PRODUCTION) {
 }
 
 // --- Cache Management ---
-const ensureCacheStructure = (cacheData, type = 'main') => {
-    const emptyMain = { timestamp: 0, shows: {} };
-    const emptyMetadata = { timestamp: 0, metadata: {}, seasons: {} };
+const ensureCacheStructure = (cacheData) => {
+    const emptyMetadata = { timestamp: 0, metadata: {}, seasons: {}, shows: {} };
 
     if (typeof cacheData !== 'object' || cacheData === null) {
-        return type === 'main' ? emptyMain : emptyMetadata;
+        return emptyMetadata;
     }
 
-    if (type === 'main') {
-        cacheData.shows = cacheData.shows || {};
-    } else {
-        cacheData.metadata = cacheData.metadata || {};
-        cacheData.seasons = cacheData.seasons || {};
-    }
+    cacheData.metadata = cacheData.metadata || {};
+    cacheData.seasons = cacheData.seasons || {};
+    cacheData.shows = cacheData.shows || {};
     cacheData.timestamp = cacheData.timestamp || 0;
     return cacheData;
 };
 
-const loadCache = async (type = 'main') => {
+const loadCache = async () => {
     const now = Date.now();
-    const emptyCache = ensureCacheStructure(null, type);
-    const cacheKeyPrefix = type === 'main' ? BLOB_CACHE_KEY_PREFIX : BLOB_METADATA_KEY_PREFIX;
-    const localFile = type === 'main' ? LOCAL_CACHE_FILE : LOCAL_METADATA_FILE;
+    const emptyCache = ensureCacheStructure(null);
+    const cacheKeyPrefix = BLOB_METADATA_KEY_PREFIX;
+    const localFile = LOCAL_METADATA_FILE;
+    const precachedFile = PRECACHED_METADATA_FILE;
 
+    // First try to load from Vercel Blob
     if (blob) {
         try {
             let mostRecent = null;
@@ -95,44 +95,69 @@ const loadCache = async (type = 'main') => {
                         if (mostRecent.size > 0) {
                             const response = await axios.get(mostRecent.url, { timeout: REQUEST_TIMEOUT_MS + 5000 });
                             if (typeof response.data === 'object' && response.data !== null) {
-                                return ensureCacheStructure(response.data, type);
+                                return ensureCacheStructure(response.data);
                             }
                         }
                     }
                 }
             } catch (listOrGetError) {
-                console.error(`Error with ${type} blob:`, listOrGetError.message);
+                console.error(`Error with blob:`, listOrGetError.message);
             }
         } catch (e) {
-            console.error(`Error loading ${type} cache:`, e.message);
-        }
-    } else {
-        try {
-            const cacheDir = path.dirname(localFile);
-            if (!fs.existsSync(cacheDir)) {
-                fs.mkdirSync(cacheDir, { recursive: true });
-            }
-            if (fs.existsSync(localFile)) {
-                return ensureCacheStructure(JSON.parse(fs.readFileSync(localFile, 'utf8')), type);
-            }
-        } catch (e) {
-            console.error(`Error loading ${type} cache from local file:`, e.message);
+            console.error(`Error loading cache:`, e.message);
         }
     }
+
+    // Then try to load from local cache
+    try {
+        const cacheDir = path.dirname(localFile);
+        if (!fs.existsSync(cacheDir)) {
+            fs.mkdirSync(cacheDir, { recursive: true });
+        }
+        if (fs.existsSync(localFile)) {
+            return ensureCacheStructure(JSON.parse(fs.readFileSync(localFile, 'utf8')));
+        }
+    } catch (e) {
+        console.error(`Error loading cache from local file:`, e.message);
+    }
+
+    // Finally try to load from precached data
+    try {
+        if (fs.existsSync(precachedFile)) {
+            console.log(`Loading precached data from: ${precachedFile}`);
+            const precached = JSON.parse(fs.readFileSync(precachedFile, 'utf8'));
+            const cache = ensureCacheStructure(precached);
+            
+            // We need to set the lastUpdated property if missing
+            if (cache.metadata) {
+                const now = Date.now();
+                Object.keys(cache.metadata).forEach(key => {
+                    if (!cache.metadata[key].lastUpdated) {
+                        cache.metadata[key].lastUpdated = now;
+                    }
+                });
+            }
+            
+            return cache;
+        }
+    } catch (e) {
+        console.error(`Error loading cache from precached file:`, e.message);
+    }
+    
     return emptyCache;
 };
 
-const saveCache = async (cache, type = 'main') => {
+const saveCache = async (cache) => {
     if (!cache || typeof cache !== 'object') {
-        console.error(`Attempted to save invalid ${type} cache object.`);
+        console.error(`Attempted to save invalid cache object.`);
         return;
     }
 
-    const cacheToSave = ensureCacheStructure({ ...cache }, type);
+    const cacheToSave = ensureCacheStructure({ ...cache });
     cacheToSave.timestamp = Date.now();
-    const count = type === 'main' ? Object.keys(cacheToSave.shows).length : Object.keys(cacheToSave.metadata).length;
-    const cacheKeyPrefix = type === 'main' ? BLOB_CACHE_KEY_PREFIX : BLOB_METADATA_KEY_PREFIX;
-    const localFile = type === 'main' ? LOCAL_CACHE_FILE : LOCAL_METADATA_FILE;
+    const count = Object.keys(cacheToSave.metadata).length;
+    const cacheKeyPrefix = BLOB_METADATA_KEY_PREFIX;
+    const localFile = LOCAL_METADATA_FILE;
 
     if (blob) {
         try {
@@ -152,10 +177,10 @@ const saveCache = async (cache, type = 'main') => {
                     await Promise.all(blobsToDelete.map(oldBlob => blob.del(oldBlob.url)));
                 }
             } catch (cleanupError) {
-                console.error(`Failed during ${type} cache cleanup:`, cleanupError.message);
+                console.error(`Failed during cache cleanup:`, cleanupError.message);
             }
         } catch (e) {
-            console.error(`Error saving ${type} cache to Blob:`, e.message);
+            console.error(`Error saving cache to Blob:`, e.message);
         }
     } else {
         try {
@@ -165,7 +190,7 @@ const saveCache = async (cache, type = 'main') => {
             }
             fs.writeFileSync(localFile, JSON.stringify(cacheToSave, null, 2), 'utf8');
         } catch (e) {
-            console.error(`Error saving ${type} cache to local file:`, e.message);
+            console.error(`Error saving cache to local file:`, e.message);
         }
     }
 };
@@ -194,30 +219,57 @@ const extractShowNameAndImages = async (url) => {
         let poster = null;
         let background = null;
         let description = 'מאקו VOD';
+        let seasons = [];
 
-        // Try JSON-LD
+        // Try JSON-LD - This is our primary source of information
         try {
             const jsonldTag = $('script[type="application/ld+json"]').html();
             if (jsonldTag) {
                 const data = JSON.parse(jsonldTag);
-                const seriesData = data['@type'] === 'TVSeries' ? data : data.partOfTVSeries;
-                const seasonData = data['@type'] === 'TVSeason' ? data : null;
-
-                if (seriesData?.name) {
-                    name = seriesData.name;
-                    if (seriesData.description) description = seriesData.description;
-                    if (seriesData.image) poster = Array.isArray(seriesData.image) ? seriesData.image[0] : seriesData.image;
-                    if (seriesData.thumbnailUrl) poster = poster || seriesData.thumbnailUrl;
-                } else if (seasonData?.name) {
-                    name = seasonData.name;
-                    if (seasonData.description) description = seasonData.description;
-                    if (seasonData.image) poster = Array.isArray(seasonData.image) ? seasonData.image[0] : seasonData.image;
+                
+                // Check if it's a TVSeries directly
+                if (data['@type'] === 'TVSeries') {
+                    name = data.name; // Directly use name from JSON-LD
+                    description = data.description || description;
+                    
+                    if (data.image) {
+                        poster = Array.isArray(data.image) ? data.image[0] : data.image;
+                    }
+                    
+                    if (data.containsSeason && Array.isArray(data.containsSeason)) {
+                        seasons = data.containsSeason;
+                    }
+                } 
+                // If it points to a TV series
+                else if (data.partOfTVSeries) {
+                    name = data.partOfTVSeries.name;
+                    description = data.partOfTVSeries.description || description;
+                    
+                    if (data.partOfTVSeries.image) {
+                        poster = Array.isArray(data.partOfTVSeries.image) ? 
+                                 data.partOfTVSeries.image[0] : data.partOfTVSeries.image;
+                    }
+                    
+                    if (data.partOfTVSeries.containsSeason && Array.isArray(data.partOfTVSeries.containsSeason)) {
+                        seasons = data.partOfTVSeries.containsSeason;
+                    }
+                }
+                // If it's a TVSeason
+                else if (data['@type'] === 'TVSeason') {
+                    name = data.name;
+                    description = data.description || description;
+                    
+                    if (data.image) {
+                        poster = Array.isArray(data.image) ? data.image[0] : data.image;
+                    }
                 }
 
-                if (name && seriesData?.containsSeason && Array.isArray(seriesData.containsSeason) && seriesData.containsSeason.length > 1) {
-                    name = `${name} (${seriesData.containsSeason.length} עונות)`;
+                if (name && name.trim() && seasons && seasons.length > 1) {
+                    name = `${name} (${seasons.length} עונות)`;
                 }
-                if(name) name = name.replace(/\s+/g, ' ').trim();
+                
+                // Clean up fields
+                if (name) name = name.replace(/\s+/g, ' ').trim();
             }
         } catch (jsonErr) {
             console.warn(`Warn parsing JSON-LD for ${url}: ${jsonErr.message.substring(0, 100)}...`);
@@ -257,7 +309,8 @@ const extractShowNameAndImages = async (url) => {
             name: name || 'Unknown Show',
             poster: poster,
             background: background,
-            description: description
+            description: description,
+            seasons: seasons.length
         };
     } catch (e) {
         console.error(`Error extracting show details from ${url}:`, e.message);
@@ -265,7 +318,8 @@ const extractShowNameAndImages = async (url) => {
             name: 'Error Loading Show',
             poster: DEFAULT_LOGO,
             background: DEFAULT_LOGO,
-            description: 'Error loading description'
+            description: 'Error loading description',
+            seasons: 0
         };
     }
 };
@@ -525,6 +579,11 @@ const getOrUpdateShowMetadata = async (showUrl, metadataCache) => {
         details = await extractShowNameAndImages(showUrl);
         if (details.name !== 'Error Loading Show' && details.name !== 'Unknown Show') {
             metadataCache.metadata[showUrl] = { ...details, lastUpdated: now };
+            // Also update shows section for backward compatibility
+            metadataCache.shows[showUrl] = { 
+                name: details.name, 
+                poster: details.poster 
+            };
             needsSave = true;
             console.log(`Updated and cached metadata for: ${showUrl}`);
         } else {
@@ -683,10 +742,22 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             searchTerm = extra.search;
         }
 
-        const mainCache = await loadCache('main');
-        const metadataCache = await loadCache('metadata');
-        const initialShows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
-        console.log(`Catalog: Extracted ${initialShows.length} initial show links.`);
+        const metadataCache = await loadCache();
+        
+        // Check if we already have shows in the cache before trying to fetch
+        let initialShows = [];
+        if (metadataCache.shows && Object.keys(metadataCache.shows).length > 0) {
+            console.log(`Using ${Object.keys(metadataCache.shows).length} shows from cache`);
+            initialShows = Object.entries(metadataCache.shows).map(([url, data]) => ({
+                url,
+                name: data.name,
+                poster: data.poster
+            }));
+        } else {
+            // Only fetch shows if not in cache
+            initialShows = await extractContent(`${BASE_URL}/mako-vod-index`, 'shows');
+            console.log(`Catalog: Extracted ${initialShows.length} initial show links.`);
+        }
 
         let filteredShows = initialShows;
         if (searchTerm) {
@@ -703,10 +774,12 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 
                 let showDetails = metadataCache.metadata?.[show.url];
                 if (!showDetails || Date.now() - (showDetails.lastUpdated || 0) > CACHE_TTL_MS) {
+                    // Only fetch metadata if not in cache or stale
                     console.log(`Catalog: Fetching metadata for ${show.url}`);
                     const { details } = await getOrUpdateShowMetadata(show.url, metadataCache);
                     showDetails = details;
                     metadataCache.metadata[show.url] = { ...details, lastUpdated: Date.now() };
+                    metadataCache.shows[show.url] = { name: details.name, poster: details.poster };
                 }
 
                 if (searchTerm && showDetails.name && !showDetails.name.toLowerCase().includes(searchTerm.toLowerCase())) {
@@ -728,19 +801,18 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             const batchResults = await Promise.all(batchPromises);
             metas.push(...batchResults.filter(Boolean));
 
+            // If we have too many shows and it's a search, just return the first batch
+            if (searchTerm && metas.length > 0 && i + BATCH_SIZE < filteredShows.length) {
+                console.log(`Returning ${metas.length} search results before processing all shows to avoid timeout`);
+                break;
+            }
+
             if (i + BATCH_SIZE < filteredShows.length) {
                 await sleep(100);
             }
         }
 
-        await saveCache(metadataCache, 'metadata');
-
-        const isMainCacheFresh = Date.now() - (mainCache.timestamp || 0) < CACHE_TTL_MS;
-        if (!isMainCacheFresh && initialShows.length > 0) {
-            mainCache.shows = {};
-            initialShows.forEach(s => { if (s.url) mainCache.shows[s.url] = { name: s.name, poster: s.poster }; });
-            await saveCache(mainCache, 'main');
-        }
+        await saveCache(metadataCache);
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'public, s-maxage=900, stale-while-revalidate=300');
@@ -768,10 +840,10 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             return res.status(400).json({ meta: null, error: 'Invalid show URL in ID' });
         }
 
-        const metadataCache = await loadCache('metadata');
+        const metadataCache = await loadCache();
         const { details: showDetails } = await getOrUpdateShowMetadata(showUrl, metadataCache);
         const { episodes } = await getShowEpisodes(showUrl, metadataCache);
-        await saveCache(metadataCache, 'metadata');
+        await saveCache(metadataCache);
 
         const videos = episodes.map(ep => ({
             id: `${id}:ep:${ep.guid}`,
@@ -828,7 +900,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             return res.status(400).json({ streams: [], error: 'Invalid show URL in ID' });
         }
 
-        const metadataCache = await loadCache('metadata');
+        const metadataCache = await loadCache();
         const { episodes } = await getShowEpisodes(showUrl, metadataCache);
         const targetEpisode = episodes.find(ep => ep.guid === episodeGuid);
 
