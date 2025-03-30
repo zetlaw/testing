@@ -214,8 +214,8 @@ initializeMetadataCache().then(success => {
     
     // Set a timeout to handle serverless timeouts gracefully
     if (IS_SERVERLESS) {
-        // Most serverless platforms have a 10 second timeout
-        const SERVERLESS_TIMEOUT_MS = 30000; // Just under 10 seconds to be safe
+        // Increase timeout to match Vercel's 60 second limit (with buffer)
+        const SERVERLESS_TIMEOUT_MS = 55000; 
         
         setTimeout(() => {
             console.log('Serverless timeout approaching, clearing queue and freeing resources');
@@ -1166,64 +1166,79 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         const showIdRaw = parts[0];
         const episodeGuid = parts[1];
-        const showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
-        
-        if (!showUrl.startsWith(BASE_URL)) {
-            return { streams: [] };
+        let showUrl;
+        try {
+            showUrl = decodeURIComponent(showIdRaw.replace('mako:', ''));
+            if (!showUrl.startsWith(BASE_URL)) throw new Error('Invalid base URL');
+        } catch (e) {
+            console.error('Invalid show URL derived from stream ID:', showIdRaw);
+            return res.status(400).json({ streams: [], error: 'Invalid show URL in ID' });
         }
 
         console.log(`Looking for episode with GUID: ${episodeGuid} from show: ${showUrl}`);
         
-        // Find target episode
+        // First try to get episode URL directly by GUID (fastest method)
         let targetEpisode = null;
+        const directEpisodeUrl = await getEpisodeUrlByGuid(episodeGuid);
         
-        // First get all seasons
-        const seasons = await extractContent(showUrl, 'seasons');
-        let allSeasons = [];
-        
-        if (seasons && seasons.length > 0) {
-            // Add main URL as Season 1
-            allSeasons = [
-                { name: "Season 1", url: showUrl },
-                ...seasons
-            ];
+        if (directEpisodeUrl) {
+            targetEpisode = {
+                guid: episodeGuid,
+                url: directEpisodeUrl,
+                name: `Episode ${episodeGuid}`
+            };
         } else {
-            // No seasons found, just use the main URL
-            allSeasons = [{ name: "Season 1", url: showUrl }];
-        }
-        
-        // Search through each season for the episode
-        for (const season of allSeasons) {
-            console.log(`Searching for episode in ${season.name}: ${season.url}`);
-            const episodes = await extractContent(season.url, 'episodes');
+            // If direct URL fails, fall back to scanning seasons
+            console.log(`Direct URL not available, fallback to season scanning`);
             
-            if (episodes && episodes.length > 0) {
-                const found = episodes.find(ep => ep.guid === episodeGuid);
-                if (found) {
-                    targetEpisode = found;
-                    console.log(`Found episode in ${season.name}: ${found.name}`);
-                    break;
+            // First get all seasons
+            const seasons = await extractContent(showUrl, 'seasons');
+            let allSeasons = [];
+            
+            if (seasons && seasons.length > 0) {
+                // Add main URL as Season 1
+                allSeasons = [
+                    { name: "Season 1", url: showUrl },
+                    ...seasons
+                ];
+            } else {
+                // No seasons found, just use the main URL
+                allSeasons = [{ name: "Season 1", url: showUrl }];
+            }
+            
+            // Search through all seasons simultaneously for the episode
+            const seasonSearchPromises = allSeasons.map(async (season) => {
+                console.log(`Searching for episode in ${season.name}: ${season.url}`);
+                const episodes = await extractContent(season.url, 'episodes');
+                
+                if (episodes && episodes.length > 0) {
+                    console.log(`Found ${episodes.length} episodes at ${season.url}`);
+                    const found = episodes.find(ep => ep.guid === episodeGuid);
+                    if (found) {
+                        console.log(`Found episode in ${season.name}: ${found.name}`);
+                        return found;
+                    }
                 }
-            }
+                return null;
+            });
             
-            // Don't sleep after the last season
-            if (season !== allSeasons[allSeasons.length - 1]) {
-                await sleep(200);
-            }
+            // Wait for all season searches to complete
+            const results = await Promise.all(seasonSearchPromises);
+            targetEpisode = results.find(ep => ep !== null);
         }
 
         if (!targetEpisode || !targetEpisode.url) {
             console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
-            return { streams: [] };
+            return res.status(404).json({ streams: [], error: 'Episode GUID not found' });
         }
 
         const videoUrl = await getVideoUrl(targetEpisode.url);
         if (!videoUrl) {
             console.error(`Stream handler: getVideoUrl failed for ${targetEpisode.url}`);
-            return { streams: [] };
+            return res.status(500).json({ streams: [], error: 'Failed to retrieve video stream URL' });
         }
 
-        return {
+        const result = {
             streams: [{
                 url: videoUrl,
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
@@ -1233,9 +1248,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 }
             }]
         };
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+        res.status(200).json(result);
     } catch (err) {
-        console.error('Stremio stream handler error:', err);
-        return { streams: [] };
+        console.error(`Stream endpoint error:`, err);
+        res.status(500).json({ streams: [], error: 'Failed to process stream request' });
     }
 });
 
@@ -1574,42 +1593,55 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 
         console.log(`Looking for episode with GUID: ${episodeGuid} from show: ${showUrl}`);
         
-        // Find target episode
+        // First try to get episode URL directly by GUID (fastest method)
         let targetEpisode = null;
+        const directEpisodeUrl = await getEpisodeUrlByGuid(episodeGuid);
         
-        // First get all seasons
-        const seasons = await extractContent(showUrl, 'seasons');
-        let allSeasons = [];
-        
-        if (seasons && seasons.length > 0) {
-            // Add main URL as Season 1
-            allSeasons = [
-                { name: "Season 1", url: showUrl },
-                ...seasons
-            ];
+        if (directEpisodeUrl) {
+            targetEpisode = {
+                guid: episodeGuid,
+                url: directEpisodeUrl,
+                name: `Episode ${episodeGuid}`
+            };
         } else {
-            // No seasons found, just use the main URL
-            allSeasons = [{ name: "Season 1", url: showUrl }];
-        }
-        
-        // Search through all seasons simultaneously for the episode
-        const seasonSearchPromises = allSeasons.map(async (season) => {
-            console.log(`Searching for episode in ${season.name}: ${season.url}`);
-            const episodes = await extractContent(season.url, 'episodes');
+            // If direct URL fails, fall back to scanning seasons
+            console.log(`Direct URL not available, fallback to season scanning`);
             
-            if (episodes && episodes.length > 0) {
-                const found = episodes.find(ep => ep.guid === episodeGuid);
-                if (found) {
-                    console.log(`Found episode in ${season.name}: ${found.name}`);
-                    return found;
-                }
+            // First get all seasons
+            const seasons = await extractContent(showUrl, 'seasons');
+            let allSeasons = [];
+            
+            if (seasons && seasons.length > 0) {
+                // Add main URL as Season 1
+                allSeasons = [
+                    { name: "Season 1", url: showUrl },
+                    ...seasons
+                ];
+            } else {
+                // No seasons found, just use the main URL
+                allSeasons = [{ name: "Season 1", url: showUrl }];
             }
-            return null;
-        });
-        
-        // Wait for all season searches to complete
-        const results = await Promise.all(seasonSearchPromises);
-        targetEpisode = results.find(ep => ep !== null);
+            
+            // Search through all seasons simultaneously for the episode
+            const seasonSearchPromises = allSeasons.map(async (season) => {
+                console.log(`Searching for episode in ${season.name}: ${season.url}`);
+                const episodes = await extractContent(season.url, 'episodes');
+                
+                if (episodes && episodes.length > 0) {
+                    console.log(`Found ${episodes.length} episodes at ${season.url}`);
+                    const found = episodes.find(ep => ep.guid === episodeGuid);
+                    if (found) {
+                        console.log(`Found episode in ${season.name}: ${found.name}`);
+                        return found;
+                    }
+                }
+                return null;
+            });
+            
+            // Wait for all season searches to complete
+            const results = await Promise.all(seasonSearchPromises);
+            targetEpisode = results.find(ep => ep !== null);
+        }
 
         if (!targetEpisode || !targetEpisode.url) {
             console.error(`Stream handler: Could not find episode URL for GUID ${episodeGuid} in show ${showUrl}`);
@@ -1662,4 +1694,34 @@ if (!IS_SERVERLESS) {
         console.log(`Install Link: stremio://127.0.0.1:${PORT}/manifest.json`);
         console.log(`---------------------------------\n`);
     });
+}
+
+/**
+ * Get episode URL directly by GUID without scanning all seasons
+ * @param {string} guid - The episode GUID 
+ * @returns {Promise<string|null>} - URL for the episode or null if not found
+ */
+async function getEpisodeUrlByGuid(guid) {
+    // Try direct URL construction first (most efficient)
+    const directUrl = `${BASE_URL}/VOD-${guid}.htm`;
+    
+    try {
+        // Validate if the URL actually works
+        console.log(`Trying direct episode URL: ${directUrl}`);
+        const response = await axios.head(directUrl, { 
+            headers: HEADERS, 
+            timeout: REQUEST_TIMEOUT_MS,
+            validateStatus: status => status < 400 // Accept any non-error status
+        });
+        
+        if (response.status < 400) {
+            console.log(`Direct episode URL valid: ${directUrl}`);
+            return directUrl;
+        }
+    } catch (error) {
+        console.log(`Direct URL construction failed: ${error.message}`);
+        // Continue to fallback method
+    }
+    
+    return null;
 }
