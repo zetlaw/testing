@@ -1253,20 +1253,17 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 url: proxiedUrl,
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
-                mimeType: 'application/x-mpegURL',
+                mimeType: 'application/vnd.apple.mpegurl',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
-                    notWebReady: false,
-                    // Set other helpful hints for players
-                    forceTranscode: false,
-                    proxyHeaders: false,
-                    playerType: 'Default'
+                    notWebReady: false
                 }
             }]
         };
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'no-store, max-age=0');
+        res.setHeader('Access-Control-Allow-Origin', '*');
         res.status(200).json(result);
     } catch (err) {
         console.error(`Stream endpoint error:`, err);
@@ -1322,27 +1319,90 @@ app.get('/proxy/:token', async (req, res) => {
         const response = await axios({
             method: 'get',
             url: originalUrl,
-            responseType: 'stream',
+            responseType: 'arraybuffer',
             timeout: 30000,
             headers: {
                 'User-Agent': USER_AGENT,
                 'Referer': 'https://www.mako.co.il/',
-                'Origin': 'https://www.mako.co.il'
+                'Origin': 'https://www.mako.co.il',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9,he;q=0.8'
             }
         });
         
-        // Set CORS headers to allow all origins
+        // Set comprehensive CORS headers
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range, Authorization');
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type');
         
-        // Forward the content type
-        if (response.headers['content-type']) {
-            res.setHeader('Content-Type', response.headers['content-type']);
+        // Forward important headers from the original response
+        for (const [key, value] of Object.entries(response.headers)) {
+            if (['content-type', 'content-length', 'etag', 'last-modified', 'cache-control'].includes(key.toLowerCase())) {
+                res.setHeader(key, value);
+            }
         }
         
-        // Send the video stream
-        response.data.pipe(res);
+        // Ensure proper content type for HLS
+        const contentType = response.headers['content-type'] || '';
+        if (originalUrl.includes('.m3u8') && !contentType.includes('application/vnd.apple.mpegurl')) {
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        } else if (!contentType) {
+            // Default content type if none specified
+            res.setHeader('Content-Type', 'application/octet-stream');
+        }
+        
+        // If this is an HLS playlist, we need to rewrite any relative URLs in it
+        if (originalUrl.includes('.m3u8')) {
+            try {
+                // Convert buffer to string and process it
+                const content = Buffer.from(response.data).toString('utf8');
+                
+                // Replace any relative URLs with absolute ones
+                const baseUrl = originalUrl.substring(0, originalUrl.lastIndexOf('/') + 1);
+                const modifiedContent = content
+                    .split('\n')
+                    .map(line => {
+                        // Skip comments and empty lines
+                        if (line.startsWith('#') || line.trim() === '') {
+                            return line;
+                        }
+                        
+                        // Process URLs - if it's not absolute, make it absolute
+                        // Then encode it for our proxy if it's a playlist
+                        if (!line.startsWith('http')) {
+                            const absoluteUrl = new URL(line, baseUrl).href;
+                            
+                            // If it's another m3u8 file, proxy it too
+                            if (line.includes('.m3u8')) {
+                                const proxyToken = Buffer.from(absoluteUrl).toString('base64');
+                                return `${req.protocol}://${req.get('host')}/proxy/${proxyToken}`;
+                            }
+                            
+                            return absoluteUrl;
+                        }
+                        
+                        // If it's already an absolute URL that is a playlist, proxy it
+                        if (line.includes('.m3u8')) {
+                            const proxyToken = Buffer.from(line).toString('base64');
+                            return `${req.protocol}://${req.get('host')}/proxy/${proxyToken}`;
+                        }
+                        
+                        return line;
+                    })
+                    .join('\n');
+                
+                // Send the modified content
+                return res.send(modifiedContent);
+            } catch (error) {
+                console.error('Error processing m3u8 content:', error.message);
+                // Fall back to sending the original response
+            }
+        }
+        
+        // For non-playlist content, just send the buffer
+        res.send(Buffer.from(response.data));
+        
     } catch (error) {
         console.error('Proxy error:', error.message);
         res.status(500).send('Error proxying video stream');
@@ -1735,20 +1795,17 @@ app.get('/stream/:type/:id.json', async (req, res) => {
                 url: proxiedUrl,
                 title: `Play: ${targetEpisode.name || 'Episode'}`,
                 type: 'hls',
-                mimeType: 'application/x-mpegURL',
+                mimeType: 'application/vnd.apple.mpegurl',
                 behaviorHints: {
                     bingeGroup: `mako-${showUrl}`,
-                    notWebReady: false,
-                    // Set other helpful hints for players
-                    forceTranscode: false,
-                    proxyHeaders: false,
-                    playerType: 'Default'
+                    notWebReady: false
                 }
             }]
         };
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'no-store, max-age=0');
+        res.setHeader('Access-Control-Allow-Origin', '*');
         res.status(200).json(result);
     } catch (err) {
         console.error(`Stream endpoint error:`, err);
