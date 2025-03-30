@@ -227,9 +227,9 @@ const extractShowNameAndImages = async (url) => {
             if (jsonldTag) {
                 const data = JSON.parse(jsonldTag);
                 
-                // Check if it's a TVSeries directly
-                if (data['@type'] === 'TVSeries') {
-                    name = data.name; // Directly use name from JSON-LD
+                // Direct extraction of name if it's a TVSeries (highest priority)
+                if (data['@type'] === 'TVSeries' && data.name) {
+                    name = data.name; // Directly use name property
                     description = data.description || description;
                     
                     if (data.image) {
