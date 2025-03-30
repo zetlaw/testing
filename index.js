@@ -1166,8 +1166,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
     }
 });
 
-const addonInterface = builder.getInterface();
-
 // Create Express app
 const express = require('express');
 const cors = require('cors');
@@ -1182,7 +1180,25 @@ app.use((req, res, next) => {
     next();
 });
 
-// Use the SDK's serveHTTP function to handle all addon routes automatically
+// Get the addon interface
+const addonInterface = builder.getInterface();
+
+// Handle catalog endpoint explicitly
+app.get('/catalog/series/mako-vod-shows.json', async (req, res) => {
+    try {
+        const result = await addonInterface.catalogHandler({
+            type: 'series',
+            id: 'mako-vod-shows',
+            extra: { search: req.query.search }
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('Error handling catalog request:', err);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// Use the SDK's serveHTTP function to handle all other addon routes automatically
 serveHTTP(addonInterface, { app });
 
 // Redirect root to manifest
